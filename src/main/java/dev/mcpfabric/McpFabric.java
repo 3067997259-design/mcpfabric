@@ -9,6 +9,7 @@ import dev.mcpfabric.handlers.CommandHandlers;
 import dev.mcpfabric.handlers.EntityHandlers;
 import dev.mcpfabric.handlers.GameEvents;
 import dev.mcpfabric.handlers.InfoHandlers;
+import dev.mcpfabric.handlers.MineEvidence;
 import dev.mcpfabric.handlers.PlayerAdminHandlers;
 import dev.mcpfabric.handlers.WorldHandlers;
 import net.fabricmc.api.ModInitializer;
@@ -77,6 +78,9 @@ public class McpFabric implements ModInitializer {
 		EntityHandlers.register(router);
 		PlayerAdminHandlers.register(router);
 		CommandHandlers.register(router);
+		// CD-M2: server-side break and drop evidence for the mining agent.
+		MineEvidence.registerEvents();
+		MineEvidence.registerRpc(router);
 		dev.mcpfabric.handlers.ChatHandlers.registerCommon(router, eventBus);
 		GameEvents.register(eventBus);
 

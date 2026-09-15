@@ -591,6 +591,29 @@ export const TOOLS: ToolDef[] = [
     annotations: WRITE,
   },
   {
+    name: "evaluate_harvest",
+    method: "mine.evaluateHarvest",
+    title: "Evaluate one block harvest",
+    description:
+      "Client-only, read-only. No side effect. Evaluate a single block before mining it: the block state id and dimension, the inventory tool candidates with durability/enchantments/eligibility/estimated ticks, whether the tool requirement is met (not a drop guarantee), the expected drop mode, environmental hazards and any unmet condition (no_tool, tool_level_too_low, unbreakable, inventory_full, data_unavailable). It never switches the real hotbar; the caller re-verifies after equipping.",
+    inputSchema: { ...vec3(), ...dimensionOpt },
+    annotations: READ,
+  },
+  {
+    name: "get_break_evidence",
+    method: "mine.breakEvidence",
+    title: "Read break and drop evidence",
+    description:
+      "Server-side, read-only. Return the recent break records near a position: the break fact for one player, and the item drops the server generated in the break transaction with the tool actually used. Newly loaded item entities near the break are attached per item id. A record without entity evidence still reports a source quantity; a merged, split, stolen or unloaded drop is never claimed as precise.",
+    inputSchema: {
+      ...vec3(),
+      ...dimensionOpt,
+      playerUuid: z.string().optional().describe("Player uuid whose break is asked for; omit to match any player."),
+      startTick: z.number().optional().describe("Only records at or after this server game tick are returned."),
+    },
+    annotations: READ,
+  },
+  {
     name: "place_block",
     method: "interact.placeBlock",
     title: "Place held block",

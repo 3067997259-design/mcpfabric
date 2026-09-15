@@ -11,6 +11,7 @@ import dev.mcpfabric.client.handlers.InteractHandlers;
 import dev.mcpfabric.client.handlers.InventoryHandlers;
 import dev.mcpfabric.client.handlers.LocalPlayerHandlers;
 import dev.mcpfabric.client.handlers.MenuHandlers;
+import dev.mcpfabric.client.handlers.MineHandlers;
 import dev.mcpfabric.client.handlers.MovementHandlers;
 import dev.mcpfabric.client.handlers.NavHandlers;
 import dev.mcpfabric.client.handlers.PlayerLifeHandlers;
@@ -34,6 +35,7 @@ public class McpFabricClient implements ClientModInitializer {
 		LocalPlayerHandlers.register(router);
 		ControlHandlers.register(router);
 		InteractHandlers.register(router);
+		MineHandlers.register(router);
 		CraftHandlers.register(router);
 		InventoryHandlers.register(router);
 		MenuHandlers.register(router);
