@@ -15,6 +15,8 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class RpcRouter {
 	private final Map<String, RpcHandler> handlers = new ConcurrentHashMap<>();
+	/** Wall-clock time of the last dispatched request; feeds the client heartbeat guard. */
+	private volatile long lastRequestAt = System.currentTimeMillis();
 
 	public void register(String method, RpcHandler handler) {
 		if (handlers.putIfAbsent(method, handler) != null) {
@@ -33,8 +35,14 @@ public final class RpcRouter {
 		return a;
 	}
 
+	/** Wall-clock time of the last dispatched request (any method). */
+	public long lastRequestAt() {
+		return lastRequestAt;
+	}
+
 	/** Dispatch a call, returning a full RPC envelope ({ok:true,result} or {ok:false,error}). */
 	public JsonObject dispatch(String method, JsonObject params) {
+		lastRequestAt = System.currentTimeMillis();
 		if (method == null || method.isBlank()) {
 			return Json.envelopeError("bad_request", "Missing 'method'.", null);
 		}

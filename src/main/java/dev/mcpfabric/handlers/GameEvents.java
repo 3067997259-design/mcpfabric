@@ -6,8 +6,10 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.Projectile;
 
 /**
  * Server-side event listeners that feed the {@link EventBus} (polled via {@code events.getRecent}
@@ -49,6 +51,16 @@ public final class GameEvents {
 			d.addProperty("x", entity.getX());
 			d.addProperty("y", entity.getY());
 			d.addProperty("z", entity.getZ());
+			// R9: name the shooter and the projectile when vanilla kept them. A
+			// consumer can then reject a kill another player's projectile caused
+			// instead of attributing it to its own shot. A null attacker (fire,
+			// fall, environment) stays absent rather than guessed.
+			Entity attacker = damageSource.getEntity();
+			if (attacker != null)
+				d.addProperty("attackerUuid", attacker.getUUID().toString());
+			Entity direct = damageSource.getDirectEntity();
+			if (direct instanceof Projectile)
+				d.addProperty("projectileUuid", direct.getUUID().toString());
 			events.emit(entity instanceof Player ? "player_death" : "entity_death", d);
 		});
 

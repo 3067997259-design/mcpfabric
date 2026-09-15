@@ -104,25 +104,31 @@ public final class WorldHandlers {
 			long scanned = 0;
 			boolean truncated = false;
 			int r2 = radius * radius;
+			// Cube shells from the center outward: a truncated scan still holds
+			// the nearest matches instead of whichever corner the budget cut.
 			outer:
-			for (int dx = -radius; dx <= radius; dx++) {
-				for (int dy = -radius; dy <= radius; dy++) {
-					for (int dz = -radius; dz <= radius; dz++) {
-						if (++scanned > SCAN_BUDGET) { truncated = true; break outer; }
-						int dist2 = dx * dx + dy * dy + dz * dz;
-						if (dist2 > r2) continue;
-						m.set(cx + dx, cy + dy, cz + dz);
-						if (!level.hasChunkAt(m)) continue;
-						BlockState state = level.getBlockState(m);
-						String id = Levels.blockId(state);
-						if (!wanted.contains(id)) continue;
-						JsonObject b = new JsonObject();
-						b.addProperty("x", m.getX());
-						b.addProperty("y", m.getY());
-						b.addProperty("z", m.getZ());
-						b.addProperty("id", id);
-						b.addProperty("distance", Math.sqrt(dist2));
-						found.add(b);
+			for (int shell = 0; shell <= radius; shell++) {
+				for (int dx = -shell; dx <= shell; dx++) {
+					for (int dy = -shell; dy <= shell; dy++) {
+						for (int dz = -shell; dz <= shell; dz++) {
+							if (Math.max(Math.abs(dx), Math.max(Math.abs(dy), Math.abs(dz))) != shell)
+								continue;
+							if (++scanned > SCAN_BUDGET) { truncated = true; break outer; }
+							int dist2 = dx * dx + dy * dy + dz * dz;
+							if (dist2 > r2) continue;
+							m.set(cx + dx, cy + dy, cz + dz);
+							if (!level.hasChunkAt(m)) continue;
+							BlockState state = level.getBlockState(m);
+							String id = Levels.blockId(state);
+							if (!wanted.contains(id)) continue;
+							JsonObject b = new JsonObject();
+							b.addProperty("x", m.getX());
+							b.addProperty("y", m.getY());
+							b.addProperty("z", m.getZ());
+							b.addProperty("id", id);
+							b.addProperty("distance", Math.sqrt(dist2));
+							found.add(b);
+						}
 					}
 				}
 			}
