@@ -555,6 +555,7 @@ export const TOOLS: ToolDef[] = [
       dirX: z.number().describe("Horizontal flight direction X (not necessarily normalized)."),
       dirZ: z.number().describe("Horizontal flight direction Z (not necessarily normalized)."),
       sprint: z.boolean().optional().describe("Hold sprint during the hop. Default false."),
+      brake: z.boolean().optional().describe("Nothing past the landing absorbs the flight overshoot (a lone pad): release the forward key near the landing and reverse when closer still. Default false."),
       takeoffRadius: z.number().optional().describe("Distance before the takeoff line at which the jump may fire. Default 0.35."),
       landingRadius: z.number().optional().describe("Horizontal landing radius that counts as landed. Default 0.7."),
       deadlineMs: z.number().optional().describe("Absolute deadline in epoch milliseconds. Default 8 seconds from start."),

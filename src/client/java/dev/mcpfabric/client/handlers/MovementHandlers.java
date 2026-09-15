@@ -37,11 +37,12 @@ public final class MovementHandlers {
 			double dirX = ctx.getDouble("dirX");
 			double dirZ = ctx.getDouble("dirZ");
 			boolean sprint = ctx.optBool("sprint", false);
+			boolean brake = ctx.optBool("brake", false);
 			double takeoffRadius = ctx.optDouble("takeoffRadius", 0.35);
 			double landingRadius = ctx.optDouble("landingRadius", 0.7);
 			long deadlineMs = ctx.optLong("deadlineMs", System.currentTimeMillis() + 8_000);
 			return ClientMc.call(() -> BotController.get().startJump(
-					tx, ty, tz, takeoffX, takeoffZ, dirX, dirZ, sprint,
+					tx, ty, tz, takeoffX, takeoffZ, dirX, dirZ, sprint, brake,
 					takeoffRadius, landingRadius, deadlineMs));
 		});
 

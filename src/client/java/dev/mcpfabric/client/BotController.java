@@ -162,8 +162,13 @@ public final class BotController {
 	/** Dropping this far below the destination ends the attempt. */
 	private double jumpFallTolerance = 1.2;
 	private boolean jumpSprint;
+	/** The flight overshoots the landing and no face past it stops the travel. */
+	private boolean jumpBrake;
 	private long jumpDeadline;
 	private int jumpTicks;
+	/** Airborne distances at which a braking flight releases and then reverses. */
+	private static final double JUMP_BRAKE_RELEASE = 1.1;
+	private static final double JUMP_BRAKE_REVERSE = 0.55;
 	/**
 	 * Ticks spent walking the last fraction to the target after touchdown.
 	 *
@@ -179,7 +184,7 @@ public final class BotController {
 	private int jumpSettleTicks;
 
 	public synchronized JsonObject startJump(double tx, double ty, double tz,
-			double takeoffX, double takeoffZ, double dirX, double dirZ, boolean sprint,
+			double takeoffX, double takeoffZ, double dirX, double dirZ, boolean sprint, boolean brake,
 			double takeoffRadius, double landingRadius, long deadlineMillis) {
 		jumpTargetX = tx;
 		jumpTargetY = ty;
@@ -190,6 +195,7 @@ public final class BotController {
 		jumpDirX = length < 1e-6 ? 0 : dirX / length;
 		jumpDirZ = length < 1e-6 ? 0 : dirZ / length;
 		jumpSprint = sprint;
+		jumpBrake = brake;
 		jumpTakeoffRadius = takeoffRadius > 0 ? takeoffRadius : 0.35;
 		jumpLandingRadius = landingRadius > 0 ? landingRadius : 0.7;
 		jumpDeadline = deadlineMillis;
@@ -291,10 +297,16 @@ public final class BotController {
 		// host-side hops in the previous direction.
 		aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
 		double passed = (p.getX() - jumpTakeoffX) * jumpDirX + (p.getZ() - jumpTakeoffZ) * jumpDirZ;
-		fwd = true;
-		back = left = right = false;
-		sprint = jumpSprint;
-		jumpHeld = p.onGround() && passed >= -jumpTakeoffRadius;
+		// Landing control: a braking flight releases the forward key as it
+		// nears the landing and reverses once closer still, so the hop settles
+		// on a lone pad instead of flying past it. A staircase does not need
+		// this: its next step face stops the travel.
+		boolean braking = jumpBrake && !p.onGround() && horizontal <= JUMP_BRAKE_RELEASE;
+		fwd = !braking || horizontal > JUMP_BRAKE_REVERSE;
+		back = braking && horizontal <= JUMP_BRAKE_REVERSE;
+		left = right = false;
+		sprint = jumpSprint && !braking;
+		jumpHeld = p.onGround() && !braking && passed >= -jumpTakeoffRadius;
 	}
 
 	// --- MC-4e riptide movement task --------------------------------------------------------
