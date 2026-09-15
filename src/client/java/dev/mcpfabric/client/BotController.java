@@ -209,23 +209,69 @@ public final class BotController {
 	private static final int JUMP_SETTLE_MAX_TICKS = 30;
 	private int jumpSettleTicks;
 
-	public synchronized JsonObject startJump(double tx, double ty, double tz,
-			double takeoffX, double takeoffZ, double dirX, double dirZ, boolean sprint, boolean brake,
-			double takeoffRadius, double landingRadius, long deadlineMillis) {
-		jumpTargetX = tx;
-		jumpTargetY = ty;
-		jumpTargetZ = tz;
-		jumpTakeoffX = takeoffX;
-		jumpTakeoffZ = takeoffZ;
-		double length = Math.sqrt(dirX * dirX + dirZ * dirZ);
-		jumpDirX = length < 1e-6 ? 0 : dirX / length;
-		jumpDirZ = length < 1e-6 ? 0 : dirZ / length;
-		jumpSprint = sprint;
-		jumpBrake = brake;
-		jumpTakeoffRadius = takeoffRadius > 0 ? takeoffRadius : 0.35;
-		jumpLandingRadius = landingRadius > 0 ? landingRadius : 0.7;
+	/**
+	 * One jump edge with its full provenance (Step 3 batch 1).
+	 *
+	 * <p>`from`/`to` are the exact stand points of the plan's path steps,
+	 * including their real support heights, so the mod can check its own start
+	 * position and report which edge it executed.
+	 */
+	public static final class JumpEdge {
+		public String edgeId = "";
+		public double fromX, fromY, fromZ;
+		public double targetX, targetY, targetZ;
+		public double takeoffX, takeoffZ;
+		public double dirX, dirZ;
+		public boolean sprint;
+		public boolean brake;
+		public double takeoffRadius = 0.35;
+		public double landingRadius = 0.7;
+	}
+
+	private String jumpEdgeId = "";
+	/** `stop` at the destination, `continue` into the queued next edge. */
+	private volatile String jumpIntent = "stop";
+	private double jumpFromX, jumpFromY, jumpFromZ;
+	/** The edge after this one, executed without a host round trip. */
+	private JumpEdge jumpNextEdge;
+	private volatile String jumpNextEdgeId = "";
+	/** Completed edges of the running task, as `edgeId@x,y,z|vx,vz`. */
+	private final List<String> jumpCompletedEdges = new ArrayList<>();
+	private volatile int jumpCompletedCount;
+
+	public synchronized JsonObject startJump(JumpEdge edge, JumpEdge next, String landingIntent, long deadlineMillis) {
+		applyEdge(edge);
+		jumpNextEdge = next;
+		jumpNextEdgeId = next != null && next.edgeId != null ? next.edgeId : "";
+		jumpIntent = landingIntent == null || landingIntent.isEmpty() ? "stop" : landingIntent;
 		jumpDeadline = deadlineMillis;
 		jumpTicks = 0;
+		jumpPredictedStop = 0;
+		jumpCompletedEdges.clear();
+		jumpCompletedCount = 0;
+		jumpState = "running";
+		jumpEndReason = "running";
+		return jumpStatusJson();
+	}
+
+	/** Copies one edge into the active fields and resets the per-edge machine. */
+	private void applyEdge(JumpEdge edge) {
+		jumpEdgeId = edge.edgeId == null ? "" : edge.edgeId;
+		jumpFromX = edge.fromX;
+		jumpFromY = edge.fromY;
+		jumpFromZ = edge.fromZ;
+		jumpTargetX = edge.targetX;
+		jumpTargetY = edge.targetY;
+		jumpTargetZ = edge.targetZ;
+		jumpTakeoffX = edge.takeoffX;
+		jumpTakeoffZ = edge.takeoffZ;
+		double length = Math.sqrt(edge.dirX * edge.dirX + edge.dirZ * edge.dirZ);
+		jumpDirX = length < 1e-6 ? 0 : edge.dirX / length;
+		jumpDirZ = length < 1e-6 ? 0 : edge.dirZ / length;
+		jumpSprint = edge.sprint;
+		jumpBrake = edge.brake;
+		jumpTakeoffRadius = edge.takeoffRadius > 0 ? edge.takeoffRadius : 0.35;
+		jumpLandingRadius = edge.landingRadius > 0 ? edge.landingRadius : 0.7;
 		jumpSettleTicks = 0;
 		jumpStableTicks = 0;
 		jumpTakeoffIssued = false;
@@ -233,10 +279,16 @@ public final class BotController {
 		jumpTouchedDown = false;
 		jumpPhase = "prepare";
 		jumpInput = "none";
-		jumpPredictedStop = 0;
-		jumpState = "running";
-		jumpEndReason = "running";
-		return jumpStatusJson();
+	}
+
+	/** Records one edge's real landing, once, as the execution evidence. */
+	private void recordEdgeCompletion(LocalPlayer p) {
+		if (!jumpCompletedEdges.isEmpty()
+				&& jumpCompletedEdges.get(jumpCompletedEdges.size() - 1).startsWith(jumpEdgeId + "@"))
+			return;
+		jumpCompletedEdges.add(jumpEdgeId + "@" + p.getX() + "," + p.getY() + "," + p.getZ()
+				+ "|" + p.getDeltaMovement().x + "," + p.getDeltaMovement().z);
+		jumpCompletedCount = jumpCompletedEdges.size();
 	}
 
 	public synchronized JsonObject cancelJump() {
@@ -262,9 +314,28 @@ public final class BotController {
 		o.addProperty("effectiveInput", jumpInput);
 		o.addProperty("predictedStop", jumpPredictedStop);
 		o.addProperty("stableTicks", jumpStableTicks);
+		o.addProperty("edgeId", jumpEdgeId);
+		o.addProperty("landingIntent", jumpIntent);
+		o.addProperty("nextEdgeId", jumpNextEdgeId);
+		o.addProperty("completedCount", jumpCompletedCount);
+		JsonArray completed = new JsonArray();
+		for (String record : jumpCompletedEdges)
+			completed.add(record);
+		o.add("completedEdges", completed);
+		JsonObject from = new JsonObject();
+		from.addProperty("x", jumpFromX);
+		from.addProperty("y", jumpFromY);
+		from.addProperty("z", jumpFromZ);
+		o.add("from", from);
+		JsonObject to = new JsonObject();
+		to.addProperty("x", jumpTargetX);
+		to.addProperty("y", jumpTargetY);
+		to.addProperty("z", jumpTargetZ);
+		o.add("to", to);
 		LocalPlayer p = Minecraft.getInstance().player;
 		if (p != null) {
 			o.addProperty("isSprinting", p.isSprinting());
+			o.addProperty("support", BuiltInRegistries.BLOCK.getKey(p.getBlockStateOn().getBlock()).toString());
 			JsonObject motion = new JsonObject();
 			motion.addProperty("x", p.getDeltaMovement().x);
 			motion.addProperty("z", p.getDeltaMovement().z);
@@ -313,6 +384,30 @@ public final class BotController {
 		boolean onTarget = horizontal <= jumpLandingRadius
 				&& Math.abs(p.getY() - jumpTargetY) <= 0.35;
 		if (onTarget && p.onGround()) {
+			recordEdgeCompletion(p);
+			// Two-edge handoff: the next edge is already known, so no host round
+			// trip is needed between the hops (that gap let the bot slide even
+			// with every key released). A sharp turn with speed still carrying in
+			// the old direction is the case that slides a one-block chain off its
+			// edge: kill that velocity first, then hand over. A straight
+			// continuation keeps its speed.
+			if (jumpNextEdge != null && jumpIntent.equals("continue")) {
+				jumpPhase = "handoff";
+				JumpEdge next = jumpNextEdge;
+				double nextLength = Math.sqrt(next.dirX * next.dirX + next.dirZ * next.dirZ);
+				double nextDirX = nextLength < 1e-6 ? 0 : next.dirX / nextLength;
+				double nextDirZ = nextLength < 1e-6 ? 0 : next.dirZ / nextLength;
+				double cos = jumpDirX * nextDirX + jumpDirZ * nextDirZ;
+				double speed = Math.hypot(p.getDeltaMovement().x, p.getDeltaMovement().z);
+				if (cos < 0.5 && speed > 0.08) {
+					releaseHorizontal(p);
+					return;
+				}
+				jumpNextEdge = null;
+				jumpNextEdgeId = "";
+				applyEdge(next);
+				return;
+			}
 			jumpPhase = "settle";
 			// Settle along the flight direction, not by facing the target: the
 			// velocity is in world space, and re-aiming after overshooting turns
@@ -937,14 +1032,16 @@ public final class BotController {
 			if (path != null) {
 				steer(p);
 			}
-			// Step 3: the jump task owns the movement input while it runs, so it
-			// is ticked after navigation and before the key application below.
-			if (jumpState.equals("running")) {
+			// Step 3 arbitration: while the jump task runs it owns both the
+			// movement input and the view. A later controller (the weapon aim)
+			// must not rotate the bot away from the edge it just aligned to.
+			boolean jumpRunning = jumpState.equals("running");
+			if (jumpRunning) {
 				tickJump(mc, p);
 			}
 			// MC-4d: the weapon task runs after movement so aiming wins the look
 			// for this tick, and before the use-key hold below.
-			if (combatPhase != CombatPhase.IDLE) {
+			if (combatPhase != CombatPhase.IDLE && !jumpRunning) {
 				tickCombat(mc, p);
 			}
 			// MC-4e: the riptide task is mutually exclusive with the weapon task.

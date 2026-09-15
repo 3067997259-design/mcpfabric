@@ -2,6 +2,7 @@ package dev.mcpfabric.client.handlers;
 
 import com.google.gson.JsonObject;
 import dev.mcpfabric.McpFabric;
+import dev.mcpfabric.bridge.RpcContext;
 import dev.mcpfabric.bridge.RpcException;
 import dev.mcpfabric.bridge.RpcRouter;
 import dev.mcpfabric.client.BotController;
@@ -29,21 +30,13 @@ public final class MovementHandlers {
 		// host's 150 ms sampling cannot time a takeoff or correct a landing.
 		router.register("movement.jump", ctx -> {
 			requireControl();
-			double tx = ctx.getDouble("targetX");
-			double ty = ctx.getDouble("targetY");
-			double tz = ctx.getDouble("targetZ");
-			double takeoffX = ctx.getDouble("takeoffX");
-			double takeoffZ = ctx.getDouble("takeoffZ");
-			double dirX = ctx.getDouble("dirX");
-			double dirZ = ctx.getDouble("dirZ");
-			boolean sprint = ctx.optBool("sprint", false);
-			boolean brake = ctx.optBool("brake", false);
-			double takeoffRadius = ctx.optDouble("takeoffRadius", 0.35);
-			double landingRadius = ctx.optDouble("landingRadius", 0.7);
 			long deadlineMs = ctx.optLong("deadlineMs", System.currentTimeMillis() + 8_000);
-			return ClientMc.call(() -> BotController.get().startJump(
-					tx, ty, tz, takeoffX, takeoffZ, dirX, dirZ, sprint, brake,
-					takeoffRadius, landingRadius, deadlineMs));
+			String landingIntent = ctx.optString("landingIntent", "stop");
+			BotController.JumpEdge edge = jumpEdgeOf(ctx, "");
+			// Optional second edge: executed in the same task, so no host round
+			// trip sits between the hops.
+			BotController.JumpEdge next = ctx.has("nextTargetX") ? jumpEdgeOf(ctx, "next") : null;
+			return ClientMc.call(() -> BotController.get().startJump(edge, next, landingIntent, deadlineMs));
 		});
 
 		router.register("movement.jumpStatus", ctx -> ClientMc.call(() -> BotController.get().jumpStatusJson()));
@@ -91,6 +84,33 @@ public final class MovementHandlers {
 				return BotController.get().cancelRiptide(mc);
 			});
 		});
+	}
+
+	/**
+	 * Reads one jump edge from the request.
+	 *
+	 * @param prefix empty for the first edge, `next` for the queued one: the
+	 * second edge carries the same fields with a `next` prefix.
+	 */
+	private static BotController.JumpEdge jumpEdgeOf(RpcContext ctx, String prefix) throws RpcException {
+		boolean next = !prefix.isEmpty();
+		BotController.JumpEdge edge = new BotController.JumpEdge();
+		edge.edgeId = ctx.optString(next ? "nextEdgeId" : "edgeId", "");
+		edge.fromX = ctx.optDouble("fromX", 0);
+		edge.fromY = ctx.optDouble("fromY", 0);
+		edge.fromZ = ctx.optDouble("fromZ", 0);
+		edge.targetX = ctx.getDouble(next ? "nextTargetX" : "targetX");
+		edge.targetY = ctx.getDouble(next ? "nextTargetY" : "targetY");
+		edge.targetZ = ctx.getDouble(next ? "nextTargetZ" : "targetZ");
+		edge.takeoffX = ctx.getDouble(next ? "nextTakeoffX" : "takeoffX");
+		edge.takeoffZ = ctx.getDouble(next ? "nextTakeoffZ" : "takeoffZ");
+		edge.dirX = ctx.getDouble(next ? "nextDirX" : "dirX");
+		edge.dirZ = ctx.getDouble(next ? "nextDirZ" : "dirZ");
+		edge.sprint = ctx.optBool("sprint", false);
+		edge.brake = ctx.optBool("brake", false);
+		edge.takeoffRadius = ctx.optDouble("takeoffRadius", 0.35);
+		edge.landingRadius = ctx.optDouble("landingRadius", 0.7);
+		return edge;
 	}
 
 	private static void requireControl() throws RpcException {
