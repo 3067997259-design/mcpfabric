@@ -164,6 +164,19 @@ public final class BotController {
 	private boolean jumpSprint;
 	private long jumpDeadline;
 	private int jumpTicks;
+	/**
+	 * Ticks spent walking the last fraction to the target after touchdown.
+	 *
+	 * <p>The landing radius (0.7) lets the hop end beside the target; a planner
+	 * node is the stand point (the block center), and the host's arrival radius
+	 * (0.45) expects it. A landing that stops 0.5 away leaves the edge
+	 * unconfirmed and the run stalls. The settle walks to the center a tick at a
+	 * time, which the host's 150 ms polls cannot do, and is bounded so a target
+	 * the bot cannot reach still ends with an honest landing report.
+	 */
+	private static final double JUMP_SETTLE_RADIUS = 0.3;
+	private static final int JUMP_SETTLE_MAX_TICKS = 30;
+	private int jumpSettleTicks;
 
 	public synchronized JsonObject startJump(double tx, double ty, double tz,
 			double takeoffX, double takeoffZ, double dirX, double dirZ, boolean sprint,
@@ -181,6 +194,7 @@ public final class BotController {
 		jumpLandingRadius = landingRadius > 0 ? landingRadius : 0.7;
 		jumpDeadline = deadlineMillis;
 		jumpTicks = 0;
+		jumpSettleTicks = 0;
 		jumpState = "running";
 		jumpEndReason = "running";
 		return jumpStatusJson();
@@ -250,7 +264,19 @@ public final class BotController {
 		boolean onTarget = horizontal <= jumpLandingRadius
 				&& Math.abs(p.getY() - jumpTargetY) <= 0.35;
 		if (onTarget && p.onGround()) {
-			finishJump("done", "landed");
+			if (horizontal <= JUMP_SETTLE_RADIUS || jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS) {
+				finishJump("done", "landed");
+				return;
+			}
+			// Touchdown beside the stand point: walk to the center without
+			// jumping. Bounded, so an unreachable center still reports landed
+			// with the distance it actually reached.
+			jumpSettleTicks++;
+			aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
+			fwd = true;
+			back = left = right = false;
+			sprint = false;
+			jumpHeld = false;
 			return;
 		}
 		if (p.getY() < jumpTargetY - jumpFallTolerance) {
