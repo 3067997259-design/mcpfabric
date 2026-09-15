@@ -7,6 +7,7 @@ import dev.mcpfabric.bridge.RpcException;
 import dev.mcpfabric.bridge.RpcRouter;
 import dev.mcpfabric.client.BotController;
 import dev.mcpfabric.client.ClientMc;
+import dev.mcpfabric.client.ControlOwnership;
 import dev.mcpfabric.client.nav.AStarPathfinder;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
@@ -24,6 +25,14 @@ public final class NavHandlers {
 		router.register("nav.pathTo", ctx -> ClientMc.call(() -> {
 			if (!McpFabric.config().enablePlayerControl) {
 				throw RpcException.unavailable("Player control is disabled (enablePlayerControl=false).");
+			}
+			// CD-0 §3.1: a stale sequence or a revoked session must not start a
+			// new drive. Unscoped callers without a session id still work.
+			String controlSessionId = ctx.optString("controlSessionId", null);
+			long sequence = ctx.optLong("sequence", 0L);
+			if (!ControlOwnership.accept(controlSessionId, sequence)) {
+				throw new RpcException("stale_control_session",
+						"Control session is revoked or the sequence is stale.", null);
 			}
 			LocalPlayer p = ClientMc.player();
 			ClientLevel level = ClientMc.level();
@@ -67,6 +76,9 @@ public final class NavHandlers {
 		router.register("nav.status", ctx -> ClientMc.call(() -> BotController.get().statusJson()));
 
 		router.register("nav.stop", ctx -> {
+			// A stop revokes input ownership so a later request from the same
+			// session cannot silently restart the drive (CD-0 §3.1).
+			ControlOwnership.revoke();
 			BotController.get().stopNavigation("cancelled");
 			BotController.get().stopAllMovement();
 			return Json.ok("navigation stopped");

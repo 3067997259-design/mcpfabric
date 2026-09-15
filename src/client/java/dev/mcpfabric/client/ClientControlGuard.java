@@ -20,17 +20,29 @@ public final class ClientControlGuard {
 
 	private static boolean wasDead;
 	private static boolean hadLevel;
-	private static long lastSeenRequestAt;
+	private static long lastSeenControlRequestAt;
+
+	/**
+	 * Clears every control surface and revokes input ownership.
+	 *
+	 * CD-0 §3.1: revoking makes a later request from the same session fail, so a
+	 * cancelled drive cannot be revived by a stray control call.
+	 */
+	private static void clearControls(String reason) {
+		BotController.get().clearAll(reason);
+		ControlOwnership.revoke();
+	}
 
 	public static void register() {
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
-			// A new connection is the reconnect signal: arm the controller and
-			// refresh the heartbeat baseline.
+			// A new connection is the reconnect signal: arm the controller,
+			// require a new control session, and refresh the heartbeat baseline.
 			wasDead = false;
-			lastSeenRequestAt = System.currentTimeMillis();
+			ControlOwnership.reset();
+			lastSeenControlRequestAt = System.currentTimeMillis();
 		});
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-			BotController.get().clearAll("disconnected");
+			clearControls("disconnected");
 			hadLevel = false;
 		});
 
@@ -42,7 +54,7 @@ public final class ClientControlGuard {
 
 		// Returning to the title screen fires no disconnect event.
 		if (hadLevel && mc.level == null) {
-			BotController.get().clearAll("world_exit");
+			clearControls("world_exit");
 			hadLevel = false;
 		}
 		else if (mc.level != null) {
@@ -52,7 +64,7 @@ public final class ClientControlGuard {
 		// One cleanup per death transition.
 		boolean dead = p != null && (p.isDeadOrDying() || p.getHealth() <= 0.0F);
 		if (dead && !wasDead) {
-			BotController.get().clearAll("death");
+			clearControls("death");
 		}
 		wasDead = dead;
 
@@ -60,20 +72,22 @@ public final class ClientControlGuard {
 		// state this tick, so an escape/reaction takes effect immediately.
 		ReflexController.get().onClientTick(mc);
 
-		// Bridge heartbeat: no request for too long while controls are held.
+		// Bridge heartbeat: no control request for too long while controls are
+		// held. CD-0 §3.1: only control methods renew this clock, so a plain
+		// observation cannot keep a cancelled or stale drive alive.
 		long timeout = McpFabric.config().heartbeatTimeoutMs;
 		if (timeout <= 0) {
 			return;
 		}
 		long now = System.currentTimeMillis();
-		long lastRequest = McpFabric.router() != null ? McpFabric.router().lastRequestAt() : now;
-		if (lastRequest != lastSeenRequestAt) {
-			lastSeenRequestAt = lastRequest;
+		long lastRequest = McpFabric.router() != null ? McpFabric.router().lastControlRequestAt() : now;
+		if (lastRequest != lastSeenControlRequestAt) {
+			lastSeenControlRequestAt = lastRequest;
 		}
-		else if (BotController.get().isDriving() && now - lastSeenRequestAt > timeout) {
-			BotController.get().clearAll("bridge_timeout");
+		else if (BotController.get().isDriving() && now - lastSeenControlRequestAt > timeout) {
+			clearControls("bridge_timeout");
 			// Avoid clearing on every silent tick.
-			lastSeenRequestAt = now;
+			lastSeenControlRequestAt = now;
 		}
 	}
 }

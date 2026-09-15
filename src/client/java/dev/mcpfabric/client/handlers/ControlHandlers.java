@@ -2,9 +2,11 @@ package dev.mcpfabric.client.handlers;
 
 import com.google.gson.JsonObject;
 import dev.mcpfabric.bridge.Json;
+import dev.mcpfabric.bridge.RpcException;
 import dev.mcpfabric.bridge.RpcRouter;
 import dev.mcpfabric.client.BotController;
 import dev.mcpfabric.client.ClientMc;
+import dev.mcpfabric.client.ControlOwnership;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.util.Mth;
@@ -17,6 +19,12 @@ public final class ControlHandlers {
 
 	public static void register(RpcRouter router) {
 		router.register("control.setInput", ctx -> {
+			// CD-0 §3.1: a revoked session or a stale sequence must not set input
+			// again. Unscoped callers without a session id still work.
+			if (!ControlOwnership.accept(ctx.optString("controlSessionId", null), ctx.optLong("sequence", 0L))) {
+				throw new RpcException("stale_control_session",
+						"Control session is revoked or the sequence is stale.", null);
+			}
 			BotController.get().setMovement(
 					ctx.optBoolean("forward"),
 					ctx.optBoolean("back"),
@@ -29,6 +37,8 @@ public final class ControlHandlers {
 		});
 
 		router.register("control.stop", ctx -> {
+			// A stop revokes input ownership so the session cannot be revived.
+			ControlOwnership.revoke();
 			BotController.get().stopAllMovement();
 			return Json.ok("stopped");
 		});

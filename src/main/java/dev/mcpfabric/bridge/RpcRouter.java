@@ -15,8 +15,31 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class RpcRouter {
 	private final Map<String, RpcHandler> handlers = new ConcurrentHashMap<>();
-	/** Wall-clock time of the last dispatched request; feeds the client heartbeat guard. */
+	/** Wall-clock time of the last dispatched request (any method). */
 	private volatile long lastRequestAt = System.currentTimeMillis();
+	/**
+	 * Wall-clock time of the last dispatched *control* request.
+	 *
+	 * CD-0 §3.1: the heartbeat renews only the current control session. A plain
+	 * observation (for example {@code world.getBlock}) must not extend a
+	 * cancelled drive, so only control-method dispatches update this clock.
+	 */
+	private volatile long lastControlRequestAt = System.currentTimeMillis();
+
+	/** Method prefixes that own player input; everything else is an observation. */
+	private static final String[] CONTROL_METHOD_PREFIXES = {
+			"control.", "nav.", "combat.", "movement.", "interact."
+	};
+
+	private static boolean isControlMethod(String method) {
+		if (method == null)
+			return false;
+		for (String prefix : CONTROL_METHOD_PREFIXES) {
+			if (method.startsWith(prefix))
+				return true;
+		}
+		return false;
+	}
 
 	public void register(String method, RpcHandler handler) {
 		if (handlers.putIfAbsent(method, handler) != null) {
@@ -40,9 +63,17 @@ public final class RpcRouter {
 		return lastRequestAt;
 	}
 
+	/** Wall-clock time of the last control request; feeds the heartbeat guard. */
+	public long lastControlRequestAt() {
+		return lastControlRequestAt;
+	}
+
 	/** Dispatch a call, returning a full RPC envelope ({ok:true,result} or {ok:false,error}). */
 	public JsonObject dispatch(String method, JsonObject params) {
-		lastRequestAt = System.currentTimeMillis();
+		long now = System.currentTimeMillis();
+		lastRequestAt = now;
+		if (isControlMethod(method))
+			lastControlRequestAt = now;
 		if (method == null || method.isBlank()) {
 			return Json.envelopeError("bad_request", "Missing 'method'.", null);
 		}
