@@ -75,7 +75,7 @@ public final class EntityHandlers {
 				if (e != null) {
 					JsonObject o = describe(e, e.position());
 					o.addProperty("dimension", Levels.dimensionId(level));
-					addExtra(o, e);
+					addExtra(o, e, level);
 					return o;
 				}
 			}
@@ -129,16 +129,49 @@ public final class EntityHandlers {
 		return o;
 	}
 
-	private static void addExtra(JsonObject o, Entity e) {
+	private static void addExtra(JsonObject o, Entity e, ServerLevel level) {
 		o.addProperty("onGround", e.onGround());
+		o.addProperty("alive", e.isAlive());
 		Vec3 v = e.getDeltaMovement();
 		JsonObject motion = new JsonObject();
 		motion.addProperty("x", v.x);
 		motion.addProperty("y", v.y);
 		motion.addProperty("z", v.z);
 		o.add("motion", motion);
+		// CD-L3: velocity is the same fact under the target-observation name, so
+		// a follow consumer reads one shape whether it uses this tool or a
+		// player state read.
+		JsonObject velocity = new JsonObject();
+		velocity.addProperty("x", v.x);
+		velocity.addProperty("y", v.y);
+		velocity.addProperty("z", v.z);
+		o.add("velocity", velocity);
 		o.addProperty("yaw", e.getYRot());
 		o.addProperty("pitch", e.getXRot());
+		// CD-L3: collision box for follow spacing and air-follow.
+		o.addProperty("width", e.getBbWidth());
+		o.addProperty("height", e.getBbHeight());
+		JsonObject bounds = new JsonObject();
+		bounds.addProperty("width", e.getBbWidth());
+		bounds.addProperty("height", e.getBbHeight());
+		o.add("bounds", bounds);
+		// CD-L3: a missing fallFlying field means the source could not observe
+		// it, never that the entity is not gliding.
+		if (e instanceof LivingEntity le) {
+			o.addProperty("fallFlying", le.isFallFlying());
+		}
+		Entity vehicle = e.getVehicle();
+		o.addProperty("riding", vehicle != null);
+		if (vehicle != null) {
+			JsonObject riding = new JsonObject();
+			riding.addProperty("uuid", vehicle.getUUID().toString());
+			riding.addProperty("type", typeId(vehicle));
+			o.add("vehicle", riding);
+		}
+		// CD-0 observation: name the source and the server tick that produced
+		// this record so the caller can compute an age and an error budget.
+		o.addProperty("source", "server-entity");
+		o.addProperty("sourceTick", level.getGameTime());
 	}
 
 	private static UUID parseUuid(String s) throws RpcException {
