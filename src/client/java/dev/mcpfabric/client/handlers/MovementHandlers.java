@@ -24,6 +24,34 @@ public final class MovementHandlers {
 	private MovementHandlers() {}
 
 	public static void register(RpcRouter router) {
+		// Step 3: per-tick one-block hop. The host plans the takeoff line and
+		// the landing and this task executes them a tick at a time, because the
+		// host's 150 ms sampling cannot time a takeoff or correct a landing.
+		router.register("movement.jump", ctx -> {
+			requireControl();
+			double tx = ctx.getDouble("targetX");
+			double ty = ctx.getDouble("targetY");
+			double tz = ctx.getDouble("targetZ");
+			double takeoffX = ctx.getDouble("takeoffX");
+			double takeoffZ = ctx.getDouble("takeoffZ");
+			double dirX = ctx.getDouble("dirX");
+			double dirZ = ctx.getDouble("dirZ");
+			boolean sprint = ctx.optBool("sprint", false);
+			double takeoffRadius = ctx.optDouble("takeoffRadius", 0.35);
+			double landingRadius = ctx.optDouble("landingRadius", 0.7);
+			long deadlineMs = ctx.optLong("deadlineMs", System.currentTimeMillis() + 8_000);
+			return ClientMc.call(() -> BotController.get().startJump(
+					tx, ty, tz, takeoffX, takeoffZ, dirX, dirZ, sprint,
+					takeoffRadius, landingRadius, deadlineMs));
+		});
+
+		router.register("movement.jumpStatus", ctx -> ClientMc.call(() -> BotController.get().jumpStatusJson()));
+
+		router.register("movement.jumpCancel", ctx -> {
+			requireControl();
+			return ClientMc.call(() -> BotController.get().cancelJump());
+		});
+
 		router.register("movement.riptide", ctx -> {
 			requireControl();
 			double tx = ctx.getDouble("targetX");

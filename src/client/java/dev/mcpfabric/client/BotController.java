@@ -144,6 +144,133 @@ public final class BotController {
 	private volatile String combatState = "idle";
 	private volatile String combatEndReason = "idle";
 
+	// --- Step 3 per-tick jump task ----------------------------------------------------------
+	/**
+	 * A one-block hop the host planned: the bot aims at the landing every tick,
+	 * holds forward, and presses jump only once it is grounded and has passed
+	 * the host's takeoff line. The host's 150 ms sampling cannot time a takeoff
+	 * or correct a landing; this task does both a tick at a time and reports the
+	 * real landing back.
+	 */
+	private volatile String jumpState = "idle";
+	private volatile String jumpEndReason = "idle";
+	private double jumpTargetX, jumpTargetY, jumpTargetZ;
+	private double jumpTakeoffX, jumpTakeoffZ;
+	private double jumpDirX, jumpDirZ;
+	private double jumpTakeoffRadius = 0.35;
+	private double jumpLandingRadius = 0.7;
+	/** Dropping this far below the destination ends the attempt. */
+	private double jumpFallTolerance = 1.2;
+	private boolean jumpSprint;
+	private long jumpDeadline;
+	private int jumpTicks;
+
+	public synchronized JsonObject startJump(double tx, double ty, double tz,
+			double takeoffX, double takeoffZ, double dirX, double dirZ, boolean sprint,
+			double takeoffRadius, double landingRadius, long deadlineMillis) {
+		jumpTargetX = tx;
+		jumpTargetY = ty;
+		jumpTargetZ = tz;
+		jumpTakeoffX = takeoffX;
+		jumpTakeoffZ = takeoffZ;
+		double length = Math.sqrt(dirX * dirX + dirZ * dirZ);
+		jumpDirX = length < 1e-6 ? 0 : dirX / length;
+		jumpDirZ = length < 1e-6 ? 0 : dirZ / length;
+		jumpSprint = sprint;
+		jumpTakeoffRadius = takeoffRadius > 0 ? takeoffRadius : 0.35;
+		jumpLandingRadius = landingRadius > 0 ? landingRadius : 0.7;
+		jumpDeadline = deadlineMillis;
+		jumpTicks = 0;
+		jumpState = "running";
+		jumpEndReason = "running";
+		return jumpStatusJson();
+	}
+
+	public synchronized JsonObject cancelJump() {
+		if (jumpState.equals("running")) {
+			jumpState = "cancelled";
+			jumpEndReason = "cancelled";
+			stopAllMovement();
+		}
+		return jumpStatusJson();
+	}
+
+	public synchronized boolean isJumpActive() {
+		return jumpState.equals("running");
+	}
+
+	public synchronized JsonObject jumpStatusJson() {
+		JsonObject o = new JsonObject();
+		o.addProperty("state", jumpState);
+		o.addProperty("endReason", jumpEndReason);
+		o.addProperty("ticks", jumpTicks);
+		LocalPlayer p = Minecraft.getInstance().player;
+		if (p != null) {
+			JsonObject position = new JsonObject();
+			position.addProperty("x", p.getX());
+			position.addProperty("y", p.getY());
+			position.addProperty("z", p.getZ());
+			o.add("position", position);
+			o.addProperty("onGround", p.onGround());
+			double dx = jumpTargetX - p.getX();
+			double dz = jumpTargetZ - p.getZ();
+			o.addProperty("distance", Math.sqrt(dx * dx + dz * dz));
+			double passed = (p.getX() - jumpTakeoffX) * jumpDirX + (p.getZ() - jumpTakeoffZ) * jumpDirZ;
+			o.addProperty("takeoffPassed", passed >= -jumpTakeoffRadius);
+		}
+		return o;
+	}
+
+	private void finishJump(String state, String reason) {
+		jumpState = state;
+		jumpEndReason = reason;
+		stopAllMovement();
+	}
+
+	/**
+	 * One tick of the jump task.
+	 *
+	 * <p>Landing is the only success: grounded, inside the landing radius and at
+	 * the destination level. Falling more than the tolerance below the
+	 * destination, the deadline, or leaving the world each fail the task.
+	 */
+	private void tickJump(Minecraft mc, LocalPlayer p) {
+		jumpTicks++;
+		if (p == null) {
+			finishJump("failed", "no_player");
+			return;
+		}
+		if (System.currentTimeMillis() > jumpDeadline) {
+			finishJump("failed", "deadline");
+			return;
+		}
+		double dx = jumpTargetX - p.getX();
+		double dz = jumpTargetZ - p.getZ();
+		double horizontal = Math.sqrt(dx * dx + dz * dz);
+		boolean onTarget = horizontal <= jumpLandingRadius
+				&& Math.abs(p.getY() - jumpTargetY) <= 0.35;
+		if (onTarget && p.onGround()) {
+			finishJump("done", "landed");
+			return;
+		}
+		if (p.getY() < jumpTargetY - jumpFallTolerance) {
+			finishJump("failed", "fell");
+			return;
+		}
+		if (jumpTicks > 200) {
+			finishJump("failed", "deadline");
+			return;
+		}
+		// Aim every tick: a rotation that lags the takeoff is what sent
+		// host-side hops in the previous direction.
+		aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
+		double passed = (p.getX() - jumpTakeoffX) * jumpDirX + (p.getZ() - jumpTakeoffZ) * jumpDirZ;
+		fwd = true;
+		back = left = right = false;
+		sprint = jumpSprint;
+		jumpHeld = p.onGround() && passed >= -jumpTakeoffRadius;
+	}
+
 	// --- MC-4e riptide movement task --------------------------------------------------------
 	private enum RiptidePhase { IDLE, CHARGING, FLYING }
 	/** Vanilla riptide launches after roughly half a second of use. */
@@ -526,6 +653,10 @@ public final class BotController {
 	 */
 	public synchronized void clearAll(String reason) {
 		stopAllMovement();
+		if (jumpState.equals("running")) {
+			jumpState = "cancelled";
+			jumpEndReason = reason;
+		}
 		miningPos = null;
 		stopMiningRequested = true;
 		releaseUseRequested = true;
@@ -555,6 +686,7 @@ public final class BotController {
 	public synchronized boolean isDriving() {
 		return fwd || back || left || right || jumpHeld || sneak || sprint
 				|| jumpOnceTicks > 0 || path != null || miningPos != null
+				|| jumpState.equals("running")
 				|| combatPhase != CombatPhase.IDLE || riptidePhase != RiptidePhase.IDLE
 				|| releaseUseRequested || stopMiningRequested;
 	}
@@ -641,6 +773,11 @@ public final class BotController {
 
 			if (path != null) {
 				steer(p);
+			}
+			// Step 3: the jump task owns the movement input while it runs, so it
+			// is ticked after navigation and before the key application below.
+			if (jumpState.equals("running")) {
+				tickJump(mc, p);
 			}
 			// MC-4d: the weapon task runs after movement so aiming wins the look
 			// for this tick, and before the use-key hold below.

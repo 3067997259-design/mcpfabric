@@ -540,6 +540,46 @@ export const TOOLS: ToolDef[] = [
     annotations: WRITE,
   },
 
+  {
+    name: "jump_plan",
+    method: "movement.jump",
+    title: "Execute one planned hop",
+    description:
+      "Client-only. Run one planned one-block hop a tick at a time: the bot aims at the landing every tick, holds forward, and presses jump once it is grounded and has passed the takeoff line (the point plus the direction given). It reports the real landing, not the intent: state=done/endReason=landed only when the bot is grounded inside the landing radius at the destination level. Pairs with jump_plan_status and jump_plan_cancel.",
+    inputSchema: {
+      targetX: z.number().describe("Landing stand point X (block center)."),
+      targetY: z.number().describe("Landing stand point Y (foot level)."),
+      targetZ: z.number().describe("Landing stand point Z (block center)."),
+      takeoffX: z.number().describe("Takeoff line point X."),
+      takeoffZ: z.number().describe("Takeoff line point Z."),
+      dirX: z.number().describe("Horizontal flight direction X (not necessarily normalized)."),
+      dirZ: z.number().describe("Horizontal flight direction Z (not necessarily normalized)."),
+      sprint: z.boolean().optional().describe("Hold sprint during the hop. Default false."),
+      takeoffRadius: z.number().optional().describe("Distance before the takeoff line at which the jump may fire. Default 0.35."),
+      landingRadius: z.number().optional().describe("Horizontal landing radius that counts as landed. Default 0.7."),
+      deadlineMs: z.number().optional().describe("Absolute deadline in epoch milliseconds. Default 8 seconds from start."),
+    },
+    annotations: WRITE,
+  },
+  {
+    name: "jump_plan_status",
+    method: "movement.jumpStatus",
+    title: "Jump task status",
+    description:
+      "Client-only. Report the per-tick jump task: state (idle/running/done/failed/cancelled), endReason (landed/fell/deadline/no_player/cancelled), ticks, the live position, the horizontal distance to the landing, onGround, and whether the takeoff line was passed.",
+    inputSchema: {},
+    annotations: READ,
+  },
+  {
+    name: "jump_plan_cancel",
+    method: "movement.jumpCancel",
+    title: "Abort the jump task",
+    description:
+      "Client-only. Abort an in-flight jump task and release every movement key it held. Reports the cancelled task state.",
+    inputSchema: {},
+    annotations: WRITE,
+  },
+
   // ===== control (client) ====================================================================
   {
     name: "set_movement",
