@@ -166,9 +166,17 @@ public final class BotController {
 	private boolean jumpBrake;
 	private long jumpDeadline;
 	private int jumpTicks;
-	/** Airborne distances at which a braking flight releases and then reverses. */
-	private static final double JUMP_BRAKE_RELEASE = 1.1;
-	private static final double JUMP_BRAKE_REVERSE = 0.55;
+	/** Ground friction speed retention, used by the settling stop estimate. */
+	private static final double GROUND_SPEED_RETENTION = 0.546;
+	/** A lone-pad landing is settled inside this centre error and speed. */
+	private static final double JUMP_SETTLE_CENTER = 0.15;
+	private static final double JUMP_SETTLE_SPEED = 0.02;
+	/** Consecutive stable ticks that end a lone-pad settle. */
+	private static final int JUMP_SETTLE_STABLE_TICKS = 2;
+	private int jumpStableTicks;
+	private volatile String jumpPhase = "idle";
+	private volatile String jumpInput = "none";
+	private double jumpPredictedStop;
 	/**
 	 * Ticks spent walking the last fraction to the target after touchdown.
 	 *
@@ -201,6 +209,10 @@ public final class BotController {
 		jumpDeadline = deadlineMillis;
 		jumpTicks = 0;
 		jumpSettleTicks = 0;
+		jumpStableTicks = 0;
+		jumpPhase = "flight";
+		jumpInput = "none";
+		jumpPredictedStop = 0;
 		jumpState = "running";
 		jumpEndReason = "running";
 		return jumpStatusJson();
@@ -224,8 +236,18 @@ public final class BotController {
 		o.addProperty("state", jumpState);
 		o.addProperty("endReason", jumpEndReason);
 		o.addProperty("ticks", jumpTicks);
+		o.addProperty("phase", jumpPhase);
+		o.addProperty("brakeRequested", jumpBrake);
+		o.addProperty("effectiveInput", jumpInput);
+		o.addProperty("predictedStop", jumpPredictedStop);
+		o.addProperty("stableTicks", jumpStableTicks);
 		LocalPlayer p = Minecraft.getInstance().player;
 		if (p != null) {
+			o.addProperty("isSprinting", p.isSprinting());
+			JsonObject motion = new JsonObject();
+			motion.addProperty("x", p.getDeltaMovement().x);
+			motion.addProperty("z", p.getDeltaMovement().z);
+			o.add("motion", motion);
 			JsonObject position = new JsonObject();
 			position.addProperty("x", p.getX());
 			position.addProperty("y", p.getY());
@@ -270,19 +292,52 @@ public final class BotController {
 		boolean onTarget = horizontal <= jumpLandingRadius
 				&& Math.abs(p.getY() - jumpTargetY) <= 0.35;
 		if (onTarget && p.onGround()) {
+			jumpPhase = "settle";
+			// Settle along the flight direction, not by facing the target: the
+			// velocity is in world space, and re-aiming after overshooting turns
+			// the brake into a push away from the goal. The stop estimate uses
+			// the ground friction so the key decision matches where the bot will
+			// actually come to rest.
+			double along = (p.getX() - jumpTargetX) * jumpDirX + (p.getZ() - jumpTargetZ) * jumpDirZ;
+			double vAlong = p.getDeltaMovement().x * jumpDirX + p.getDeltaMovement().z * jumpDirZ;
+			jumpPredictedStop = along + vAlong / (1 - GROUND_SPEED_RETENTION);
+			if (jumpBrake) {
+				if (Math.abs(along) <= JUMP_SETTLE_CENTER && Math.abs(vAlong) <= JUMP_SETTLE_SPEED) {
+					jumpStableTicks++;
+					if (jumpStableTicks >= JUMP_SETTLE_STABLE_TICKS) {
+						stopAllMovement();
+						finishJump("done", "landed");
+						return;
+					}
+					releaseHorizontal(p);
+					return;
+				}
+				jumpStableTicks = 0;
+				if (jumpPredictedStop > JUMP_SETTLE_CENTER) {
+					// Will rest past the centre: face along the flight and push back.
+					aimAlongFlight(p);
+					pressHorizontal(false);
+					return;
+				}
+				if (jumpPredictedStop < -JUMP_SETTLE_CENTER) {
+					aimAlongFlight(p);
+					pressHorizontal(true);
+					return;
+				}
+				// The coast lands inside the window: release and let friction stop it.
+				releaseHorizontal(p);
+				return;
+			}
 			if (horizontal <= JUMP_SETTLE_RADIUS || jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS) {
+				stopAllMovement();
 				finishJump("done", "landed");
 				return;
 			}
-			// Touchdown beside the stand point: walk to the center without
-			// jumping. Bounded, so an unreachable center still reports landed
-			// with the distance it actually reached.
+			// A staircase landing keeps its speed and only walks the last
+			// fraction to the stand point.
 			jumpSettleTicks++;
 			aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
-			fwd = true;
-			back = left = right = false;
-			sprint = false;
-			jumpHeld = false;
+			pressHorizontal(true);
 			return;
 		}
 		if (p.getY() < jumpTargetY - jumpFallTolerance) {
@@ -297,16 +352,36 @@ public final class BotController {
 		// host-side hops in the previous direction.
 		aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
 		double passed = (p.getX() - jumpTakeoffX) * jumpDirX + (p.getZ() - jumpTakeoffZ) * jumpDirZ;
-		// Landing control: a braking flight releases the forward key as it
-		// nears the landing and reverses once closer still, so the hop settles
-		// on a lone pad instead of flying past it. A staircase does not need
-		// this: its next step face stops the travel.
-		boolean braking = jumpBrake && !p.onGround() && horizontal <= JUMP_BRAKE_RELEASE;
-		fwd = !braking || horizontal > JUMP_BRAKE_REVERSE;
-		back = braking && horizontal <= JUMP_BRAKE_REVERSE;
+		// The flight keeps its forward press: releasing mid-air barely changes
+		// the velocity and made hops land short of their pad. All stop control
+		// happens after the first touchdown, where friction and the back key
+		// actually work (the settle above).
+		jumpPhase = "flight";
+		pressHorizontal(true);
+		jumpHeld = p.onGround() && passed >= -jumpTakeoffRadius;
+	}
+
+	/** Forward + sprint as one key set, recorded for the status trace. */
+	private void pressHorizontal(boolean forward) {
+		fwd = forward;
+		back = !forward;
 		left = right = false;
-		sprint = jumpSprint && !braking;
-		jumpHeld = p.onGround() && !braking && passed >= -jumpTakeoffRadius;
+		sprint = forward && jumpSprint;
+		jumpHeld = false;
+		jumpInput = forward ? "forward" : "back";
+	}
+
+	/** Releases every horizontal key and lets friction stop the bot. */
+	private void releaseHorizontal(LocalPlayer p) {
+		fwd = back = left = right = false;
+		sprint = false;
+		jumpHeld = false;
+		jumpInput = "none";
+	}
+
+	/** Keeps the view on the flight direction so `back` opposes the velocity. */
+	private void aimAlongFlight(LocalPlayer p) {
+		aimAtPoint(p, p.getX() + jumpDirX, p.getY(), p.getZ() + jumpDirZ);
 	}
 
 	// --- MC-4e riptide movement task --------------------------------------------------------
