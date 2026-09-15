@@ -182,6 +182,16 @@ public final class BotController {
 	/** Consecutive stable ticks that end a lone-pad settle. */
 	private static final int JUMP_SETTLE_STABLE_TICKS = 2;
 	private int jumpStableTicks;
+	/**
+	 * State-machine facts for one jump edge.
+	 *
+	 * <p>Issuing the jump input is not a takeoff, and touching down is not a
+	 * completion. Without these the task re-pressed jump the moment it was
+	 * grounded again and turned a landing adjustment into another takeoff.
+	 */
+	private boolean jumpTakeoffIssued;
+	private boolean jumpAirborneSeen;
+	private boolean jumpTouchedDown;
 	private volatile String jumpPhase = "idle";
 	private volatile String jumpInput = "none";
 	private double jumpPredictedStop;
@@ -218,7 +228,10 @@ public final class BotController {
 		jumpTicks = 0;
 		jumpSettleTicks = 0;
 		jumpStableTicks = 0;
-		jumpPhase = "flight";
+		jumpTakeoffIssued = false;
+		jumpAirborneSeen = false;
+		jumpTouchedDown = false;
+		jumpPhase = "prepare";
 		jumpInput = "none";
 		jumpPredictedStop = 0;
 		jumpState = "running";
@@ -370,13 +383,32 @@ public final class BotController {
 		// host-side hops in the previous direction.
 		aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
 		double passed = (p.getX() - jumpTakeoffX) * jumpDirX + (p.getZ() - jumpTakeoffZ) * jumpDirZ;
+		// State machine: prepare -> takeoff -> airborne -> adjust -> done.
+		// Issuing jump is its own state; only an observed liftoff leaves it, the
+		// jump key is released there, and a touchdown never re-arms it.
+		if (!p.onGround())
+			jumpAirborneSeen = true;
+		else if (jumpAirborneSeen)
+			jumpTouchedDown = true;
+		jumpPhase = jumpTouchedDown ? "adjust" : jumpAirborneSeen ? "airborne" : "prepare";
+		if (jumpTakeoffIssued && !jumpAirborneSeen) {
+			// The input was issued but no liftoff was observed (a wall in the
+			// way): keep it issued for this edge only, never a second press.
+			jumpHeld = true;
+			return;
+		}
+		if (!jumpTakeoffIssued && p.onGround() && passed >= -jumpTakeoffRadius) {
+			jumpTakeoffIssued = true;
+			jumpPhase = "takeoff";
+			pressHorizontal(true);
+			jumpHeld = true;
+			return;
+		}
 		// The flight keeps its forward press: releasing mid-air barely changes
 		// the velocity and made hops land short of their pad. All stop control
 		// happens after the first touchdown, where friction and the back key
 		// actually work (the settle above).
-		jumpPhase = "flight";
 		pressHorizontal(true);
-		jumpHeld = p.onGround() && passed >= -jumpTakeoffRadius;
 	}
 
 	/** Forward + sprint as one key set, recorded for the status trace. */
