@@ -2,6 +2,7 @@ package dev.mcpfabric.handlers;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import dev.mcpfabric.McpFabric;
 import dev.mcpfabric.ServerHolder;
@@ -19,10 +20,13 @@ import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /** World read (block/region/find/time/weather/dimensions/raycast) and write (set/fill/time/weather). */
@@ -31,6 +35,52 @@ public final class WorldHandlers {
 	private static final int SCAN_BUDGET = 250_000;
 
 	private WorldHandlers() {}
+
+	/**
+	 * Cell-local collision boxes of one state, or an empty array for a non-air
+	 * block that does not collide.
+	 *
+	 * Returns null for a full cube: the client derives that box from the block
+	 * id, so sending it would only bloat the region read. Full cubes are the
+	 * common case, which is why the result is cached per state for one read.
+	 */
+	private static JsonArray partialCollisionOf(ServerLevel level, BlockPos pos, BlockState state, Map<BlockState, JsonElement> cache) {
+		JsonElement cached = cache.get(state);
+		if (cached != null)
+			return cached instanceof JsonArray array ? array : null;
+		JsonElement result = JsonNull.INSTANCE;
+		VoxelShape shape = state.getCollisionShape(level, pos);
+		if (!shape.isEmpty()) {
+			List<AABB> boxes = shape.toAabbs();
+			if (!isFullCube(boxes)) {
+				JsonArray array = new JsonArray();
+				for (AABB box : boxes) {
+					JsonObject b = new JsonObject();
+					b.addProperty("minX", box.minX - pos.getX());
+					b.addProperty("minY", box.minY - pos.getY());
+					b.addProperty("minZ", box.minZ - pos.getZ());
+					b.addProperty("maxX", box.maxX - pos.getX());
+					b.addProperty("maxY", box.maxY - pos.getY());
+					b.addProperty("maxZ", box.maxZ - pos.getZ());
+					array.add(b);
+				}
+				result = array;
+			}
+		}
+		else {
+			result = new JsonArray();
+		}
+		cache.put(state, result);
+		return result instanceof JsonArray array ? array : null;
+	}
+
+	private static boolean isFullCube(List<AABB> boxes) {
+		if (boxes.size() != 1)
+			return false;
+		AABB box = boxes.get(0);
+		return box.minX == 0.0 && box.minY == 0.0 && box.minZ == 0.0
+				&& box.maxX == 1.0 && box.maxY == 1.0 && box.maxZ == 1.0;
+	}
 
 	public static void register(RpcRouter router) {
 		router.register("world.getBlock", ctx -> onServer(server -> {
@@ -59,6 +109,7 @@ public final class WorldHandlers {
 			int cap = ctx.optInt("maxBlocks", DEFAULT_REGION_CAP);
 
 			JsonArray blocks = new JsonArray();
+			Map<BlockState, JsonElement> shapeCache = new IdentityHashMap<>();
 			BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
 			boolean truncated = false;
 			long scanned = 0;
@@ -76,6 +127,11 @@ public final class WorldHandlers {
 						b.addProperty("y", y);
 						b.addProperty("z", z);
 						b.addProperty("id", Levels.blockId(state));
+						if (!state.isAir()) {
+							JsonArray collision = partialCollisionOf(level, m, state, shapeCache);
+							if (collision != null)
+								b.add("collision", collision);
+						}
 						blocks.add(b);
 						scanned++;
 					}
@@ -86,6 +142,9 @@ public final class WorldHandlers {
 			o.addProperty("volume", volume);
 			o.addProperty("count", blocks.size());
 			o.addProperty("truncated", truncated);
+			// Full-cube boxes are omitted; partial and empty shapes are exact per
+			// state, so a consumer may treat this read as shape-complete.
+			o.addProperty("exactShapes", true);
 			o.add("blocks", blocks);
 			return o;
 		}));

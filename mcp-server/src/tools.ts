@@ -555,6 +555,8 @@ export const TOOLS: ToolDef[] = [
       jump: z.boolean().optional(),
       sneak: z.boolean().optional(),
       sprint: z.boolean().optional(),
+      controlSessionId: z.string().optional().describe("Input-ownership session id (CD-0). Omit for unscoped legacy callers; the bridge then accepts the input."),
+      sequence: z.number().int().nonnegative().optional().describe("Monotonic sequence within the control session. A value not greater than the last accepted one is rejected with stale_control_session."),
     },
   },
   {
@@ -890,6 +892,8 @@ export const TOOLS: ToolDef[] = [
       sprint: z.boolean().optional().default(false),
       timeoutSeconds: z.number().int().min(1).max(600).optional().default(60),
       commandId: z.string().optional().describe("Opaque caller command id; reflex events echo it when they preempt this navigation."),
+      controlSessionId: z.string().optional().describe("Input-ownership session id (CD-0). Omit for unscoped legacy callers."),
+      sequence: z.number().int().nonnegative().optional().describe("Monotonic sequence within the control session; a stale value is rejected with stale_control_session."),
     },
   },
   {
