@@ -179,6 +179,27 @@ public final class BotController {
 	 */
 	private static final double JUMP_SETTLE_CENTER = 0.3;
 	private static final double JUMP_SETTLE_SPEED = 0.1;
+	/**
+	 * Ground input acceleration per tick and the support footprint margin.
+	 *
+	 * <p>The player half-width is about 0.3, so a centre 0.3 from a 1-block pad
+	 * still hangs a corner over the edge; the candidates must keep the centre
+	 * inside 0.2 of the block centre per world axis (Step 3 batch 2).
+	 */
+	private static final double GROUND_INPUT_ACCELERATION = 0.098;
+	private static final double JUMP_SUPPORT_MARGIN = 0.2;
+	/** Parking zone half-width per world axis: lone pads need the tight one. */
+	private static final double JUMP_PARK_ZONE_TIGHT = 0.15;
+	private static final double JUMP_PARK_ZONE_WIDE = 0.3;
+	/** Candidate settle inputs as (forward, strafe-right) component signs. */
+	private static final int[][] JUMP_SETTLE_CANDIDATES = {
+			{ 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+			{ 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 },
+	};
+	private double jumpAlongError;
+	private double jumpLateralError;
+	private double jumpZone;
+	private double jumpPredictedX, jumpPredictedZ;
 	/** Consecutive stable ticks that end a lone-pad settle. */
 	private static final int JUMP_SETTLE_STABLE_TICKS = 2;
 	private int jumpStableTicks;
@@ -314,6 +335,13 @@ public final class BotController {
 		o.addProperty("effectiveInput", jumpInput);
 		o.addProperty("predictedStop", jumpPredictedStop);
 		o.addProperty("stableTicks", jumpStableTicks);
+		o.addProperty("alongError", jumpAlongError);
+		o.addProperty("lateralError", jumpLateralError);
+		o.addProperty("parkZone", jumpZone);
+		JsonObject predicted = new JsonObject();
+		predicted.addProperty("x", jumpPredictedX);
+		predicted.addProperty("z", jumpPredictedZ);
+		o.add("predictedStopXZ", predicted);
 		o.addProperty("edgeId", jumpEdgeId);
 		o.addProperty("landingIntent", jumpIntent);
 		o.addProperty("nextEdgeId", jumpNextEdgeId);
@@ -409,61 +437,7 @@ public final class BotController {
 				return;
 			}
 			jumpPhase = "settle";
-			// Settle along the flight direction, not by facing the target: the
-			// velocity is in world space, and re-aiming after overshooting turns
-			// the brake into a push away from the goal. The stop estimate uses
-			// the ground friction so the key decision matches where the bot will
-			// actually come to rest.
-			double along = (p.getX() - jumpTargetX) * jumpDirX + (p.getZ() - jumpTargetZ) * jumpDirZ;
-			double vAlong = p.getDeltaMovement().x * jumpDirX + p.getDeltaMovement().z * jumpDirZ;
-			jumpPredictedStop = along + vAlong / (1 - GROUND_SPEED_RETENTION);
-			if (jumpBrake) {
-				jumpSettleTicks++;
-				// The settle is bounded: a controller that cannot centre the bot
-				// must not report failure for a landing that is already on the
-				// pad, so the cap accepts the measured position when it is
-				// inside the host's goal tolerance.
-				if (jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS && Math.abs(along) <= 0.5) {
-					stopAllMovement();
-					finishJump("done", "landed");
-					return;
-				}
-				if (Math.abs(along) <= JUMP_SETTLE_CENTER && Math.abs(vAlong) <= JUMP_SETTLE_SPEED) {
-					jumpStableTicks++;
-					if (jumpStableTicks >= JUMP_SETTLE_STABLE_TICKS) {
-						stopAllMovement();
-						finishJump("done", "landed");
-						return;
-					}
-					releaseHorizontal(p);
-					return;
-				}
-				jumpStableTicks = 0;
-				if (jumpPredictedStop > JUMP_SETTLE_CENTER) {
-					// Will rest past the centre: face along the flight and push back.
-					aimAlongFlight(p);
-					pressHorizontal(false);
-					return;
-				}
-				if (jumpPredictedStop < -JUMP_SETTLE_CENTER) {
-					aimAlongFlight(p);
-					pressHorizontal(true);
-					return;
-				}
-				// The coast lands inside the window: release and let friction stop it.
-				releaseHorizontal(p);
-				return;
-			}
-			if (horizontal <= JUMP_SETTLE_RADIUS || jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS) {
-				stopAllMovement();
-				finishJump("done", "landed");
-				return;
-			}
-			// A staircase landing keeps its speed and only walks the last
-			// fraction to the stand point.
-			jumpSettleTicks++;
-			aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
-			pressHorizontal(true);
+			settleJump(p);
 			return;
 		}
 		if (p.getY() < jumpTargetY - jumpFallTolerance) {
@@ -504,6 +478,129 @@ public final class BotController {
 		// happens after the first touchdown, where friction and the back key
 		// actually work (the settle above).
 		pressHorizontal(true);
+	}
+
+	/**
+	 * Two-dimensional settling (Step 3 batch 2).
+	 *
+	 * <p>The landing is controlled in the edge's own frame: the along axis is the
+	 * flight direction and the lateral axis its perpendicular, so a residual
+	 * velocity from the previous hop is seen even when the heading is already
+	 * correct. Each tick predicts where a release would stop the bot, and if the
+	 * coast does not rest inside the parking zone it enumerates the nine
+	 * horizontal inputs, rejects any whose predicted rest leaves the landing
+	 * support, and executes the one that stops closest to the centre for exactly
+	 * one tick before deciding again. Touched down, stopped and ready-to-continue
+	 * stay separate verdicts.
+	 */
+	private void settleJump(LocalPlayer p) {
+		double centreX = Math.floor(jumpTargetX) + 0.5;
+		double centreZ = Math.floor(jumpTargetZ) + 0.5;
+		jumpZone = jumpBrake ? JUMP_PARK_ZONE_TIGHT : JUMP_PARK_ZONE_WIDE;
+		double normalX = -jumpDirZ;
+		double normalZ = jumpDirX;
+		double vx = p.getDeltaMovement().x;
+		double vz = p.getDeltaMovement().z;
+		double speed = Math.hypot(vx, vz);
+		jumpAlongError = (p.getX() - centreX) * jumpDirX + (p.getZ() - centreZ) * jumpDirZ;
+		jumpLateralError = (p.getX() - centreX) * normalX + (p.getZ() - centreZ) * normalZ;
+		jumpSettleTicks++;
+
+		double stopSpeed = jumpBrake ? 0.02 : JUMP_SETTLE_SPEED;
+		boolean parked = Math.abs(p.getX() - centreX) <= jumpZone
+				&& Math.abs(p.getZ() - centreZ) <= jumpZone
+				&& speed <= stopSpeed;
+		if (parked) {
+			jumpStableTicks++;
+			if (jumpStableTicks >= JUMP_SETTLE_STABLE_TICKS) {
+				stopAllMovement();
+				finishJump("done", "landed");
+				return;
+			}
+			releaseHorizontal(p);
+			return;
+		}
+		jumpStableTicks = 0;
+		// The settle is bounded: a controller that cannot centre the bot must not
+		// report failure for a landing that is already on the pad, so the cap
+		// accepts the measured position when it is inside the host's tolerance.
+		if (jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS && Math.hypot(jumpAlongError, jumpLateralError) <= 0.5) {
+			stopAllMovement();
+			finishJump("done", "landed");
+			return;
+		}
+
+		// Coasting: where a release comes to rest.
+		double predictedX = p.getX() + vx / (1 - GROUND_SPEED_RETENTION);
+		double predictedZ = p.getZ() + vz / (1 - GROUND_SPEED_RETENTION);
+		double bestX = predictedX;
+		double bestZ = predictedZ;
+		double bestScore = stopDistance(predictedX, predictedZ, centreX, centreZ);
+		boolean bestOnSupport = onLandingSupport(predictedX, predictedZ, centreX, centreZ);
+		int bestForward = 0;
+		int bestStrafe = 0;
+		for (int[] candidate : JUMP_SETTLE_CANDIDATES) {
+			int forward = candidate[0];
+			int strafe = candidate[1];
+			double inputX = forward * jumpDirX + strafe * normalX;
+			double inputZ = forward * jumpDirZ + strafe * normalZ;
+			double length = Math.hypot(inputX, inputZ);
+			if (length > 1e-6) {
+				inputX /= length;
+				inputZ /= length;
+			}
+			// One tick of input, then release: this tick's travel is the
+			// post-input speed, and the remaining travel decays by q per tick.
+			double candidateX = p.getX() + (vx + GROUND_INPUT_ACCELERATION * inputX) / (1 - GROUND_SPEED_RETENTION);
+			double candidateZ = p.getZ() + (vz + GROUND_INPUT_ACCELERATION * inputZ) / (1 - GROUND_SPEED_RETENTION);
+			if (!onLandingSupport(candidateX, candidateZ, centreX, centreZ))
+				continue;
+			double score = stopDistance(candidateX, candidateZ, centreX, centreZ);
+			if (!bestOnSupport || score < bestScore) {
+				bestOnSupport = true;
+				bestScore = score;
+				bestForward = forward;
+				bestStrafe = strafe;
+				bestX = candidateX;
+				bestZ = candidateZ;
+			}
+		}
+		jumpPredictedX = bestX;
+		jumpPredictedZ = bestZ;
+		jumpPredictedStop = Math.hypot(bestX - centreX, bestZ - centreZ);
+		aimAlongFlight(p);
+		applySettleInput(bestForward, bestStrafe);
+	}
+
+	private static double stopDistance(double x, double z, double centreX, double centreZ) {
+		return Math.hypot(x - centreX, z - centreZ);
+	}
+
+	/** True when the feet centre stays inside the landing block. */
+	private static boolean onLandingSupport(double x, double z, double centreX, double centreZ) {
+		return Math.abs(x - centreX) <= 0.5 - JUMP_SUPPORT_MARGIN + 1e-6
+				&& Math.abs(z - centreZ) <= 0.5 - JUMP_SUPPORT_MARGIN + 1e-6;
+	}
+
+	/** Applies one candidate input, with the view already on the flight. */
+	private void applySettleInput(int forward, int strafe) {
+		fwd = forward > 0;
+		back = forward < 0;
+		left = strafe < 0;
+		right = strafe > 0;
+		sprint = false;
+		jumpHeld = false;
+		jumpInput = inputName(forward, strafe);
+	}
+
+	private static String inputName(int forward, int strafe) {
+		String along = forward > 0 ? "forward" : forward < 0 ? "back" : "";
+		String side = strafe > 0 ? "right" : strafe < 0 ? "left" : "";
+		if (along.isEmpty())
+			return side.isEmpty() ? "none" : side;
+		if (side.isEmpty())
+			return along;
+		return along + "-" + side;
 	}
 
 	/** Forward + sprint as one key set, recorded for the status trace. */
