@@ -10,7 +10,6 @@ import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
-import org.jetbrains.annotations.Nullable;
 
 /** Read-only state of the local player: position/vitals, inventory, equipment, effects. */
 public final class LocalPlayerHandlers {
@@ -43,6 +42,14 @@ public final class LocalPlayerHandlers {
 			o.addProperty("sprinting", p.isSprinting());
 			o.addProperty("sneaking", p.isShiftKeyDown());
 			o.addProperty("usingItem", p.isUsingItem());
+			// MC-4a: use lifecycle. `usingTicks` is the charge progress the
+			// remote layer polls while holding a bow/trident/food.
+			o.addProperty("usingTicks", p.getTicksUsingItem());
+			o.addProperty("usingHand", p.getUsedItemHand().name().toLowerCase());
+			ItemStack useItem = p.getUseItem();
+			o.addProperty("usingItemId", useItem.isEmpty() ? "" : BuiltInRegistries.ITEM.getKey(useItem.getItem()).toString());
+			// MC-3c: flight state for the elytra mover (deploy, cruise, landing).
+			o.addProperty("fallFlying", p.isFallFlying());
 			o.addProperty("selectedSlot", selectedSlot(p.getInventory()));
 			//? if <1.21.11 {
 				o.addProperty("dimension", p.level().dimension().location().toString());
@@ -50,6 +57,28 @@ public final class LocalPlayerHandlers {
 				/*o.addProperty("dimension", p.level().dimension().identifier().toString());*/
 			var gm = ClientMc.mc().gameMode;
 			o.addProperty("gameMode", gm != null ? gm.getPlayerMode().getName() : "unknown");
+			// MC-3c X-10: the game host needs the local player identity to drop
+			// its own chat echo. UUID is stable across mappings; the profile
+			// name follows the 1.21.9 record accessor.
+			o.addProperty("uuid", p.getUUID().toString());
+			//? if <1.21.9 {
+			o.addProperty("name", p.getGameProfile().getName());
+			//?} else
+			/*o.addProperty("name", p.getGameProfile().name());*/
+			return o;
+		}));
+
+		router.register("player.getVehicle", ctx -> ClientMc.call(() -> {
+			LocalPlayer p = ClientMc.player();
+			var vehicle = p.getVehicle();
+			JsonObject o = new JsonObject();
+			if (vehicle == null) {
+				o.addProperty("riding", false);
+			} else {
+				o.addProperty("riding", true);
+				o.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(vehicle.getType()).toString());
+				o.addProperty("uuid", vehicle.getUUID().toString());
+			}
 			return o;
 		}));
 
@@ -75,25 +104,25 @@ public final class LocalPlayerHandlers {
 			for (EquipmentSlot slot : new EquipmentSlot[]{EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET}) {
 				ItemStack st = p.getItemBySlot(slot);
 				if (!st.isEmpty()) {
-					JsonObject j = itemJson(st);
+					JsonObject j = ItemJson.of(st);
 					j.addProperty("slot", slot.getName());
 					armor.add(j);
 				}
 			}
 			o.add("armor", armor);
-			o.add("offhand", itemJson(p.getOffhandItem()));
+			o.add("offhand", ItemJson.of(p.getOffhandItem()));
 			return o;
 		}));
 
 		router.register("player.getEquipment", ctx -> ClientMc.call(() -> {
 			LocalPlayer p = ClientMc.player();
 			JsonObject o = new JsonObject();
-			o.add("mainHand", itemJson(p.getMainHandItem()));
-			o.add("offHand", itemJson(p.getOffhandItem()));
-			o.add("helmet", itemJson(p.getItemBySlot(EquipmentSlot.HEAD)));
-			o.add("chest", itemJson(p.getItemBySlot(EquipmentSlot.CHEST)));
-			o.add("legs", itemJson(p.getItemBySlot(EquipmentSlot.LEGS)));
-			o.add("boots", itemJson(p.getItemBySlot(EquipmentSlot.FEET)));
+			o.add("mainHand", ItemJson.of(p.getMainHandItem()));
+			o.add("offHand", ItemJson.of(p.getOffhandItem()));
+			o.add("helmet", ItemJson.of(p.getItemBySlot(EquipmentSlot.HEAD)));
+			o.add("chest", ItemJson.of(p.getItemBySlot(EquipmentSlot.CHEST)));
+			o.add("legs", ItemJson.of(p.getItemBySlot(EquipmentSlot.LEGS)));
+			o.add("boots", ItemJson.of(p.getItemBySlot(EquipmentSlot.FEET)));
 			return o;
 		}));
 
@@ -125,25 +154,8 @@ public final class LocalPlayerHandlers {
 
 	private static void addItem(JsonArray arr, int slot, ItemStack stack) {
 		if (stack.isEmpty()) return;
-		JsonObject o = itemJson(stack);
+		JsonObject o = ItemJson.of(stack);
 		o.addProperty("slot", slot);
 		arr.add(o);
-	}
-
-	@Nullable
-	private static JsonObject itemJson(ItemStack stack) {
-		JsonObject o = new JsonObject();
-		if (stack.isEmpty()) {
-			o.addProperty("empty", true);
-			return o;
-		}
-		o.addProperty("id", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
-		o.addProperty("count", stack.getCount());
-		o.addProperty("name", stack.getHoverName().getString());
-		if (stack.isDamageableItem()) {
-			o.addProperty("damage", stack.getDamageValue());
-			o.addProperty("maxDamage", stack.getMaxDamage());
-		}
-		return o;
 	}
 }
