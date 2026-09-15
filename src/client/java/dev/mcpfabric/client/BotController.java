@@ -206,6 +206,7 @@ public final class BotController {
 	 * <p>Recorded before any key changes and never used to choose inputs yet:
 	 * the predicted trails are aligned against the real per-tick trail first.
 	 */
+	private JsonObject jumpPredictionFirst;
 	private JsonObject jumpPredictionNow;
 	private JsonObject jumpPredictionWait;
 	private final List<JsonObject> jumpRealTrail = new ArrayList<>();
@@ -216,6 +217,9 @@ public final class BotController {
 	private static final int JUMP_HANDOFF_SETTLE_TICKS = 12;
 	/** Drift above which the takeoff waits for friction to stop the bot. */
 	private static final double JUMP_TAKEOFF_MAX_SPEED = 0.06;
+	/** Bounded waiting at the line before a takeoff is forced or refused. */
+	private static final int JUMP_TAKEOFF_WAIT_MAX = 12;
+	private int jumpWaitTicks;
 	private int jumpStableTicks;
 	/**
 	 * State-machine facts for one jump edge.
@@ -299,8 +303,11 @@ public final class BotController {
 		jumpPredictedStop = 0;
 		jumpCompletedEdges.clear();
 		jumpCompletedCount = 0;
+		jumpPredictionFirst = null;
 		jumpPredictionNow = null;
 		jumpPredictionWait = null;
+		jumpWaitTicks = 0;
+		jumpTakeoffTrace = "";
 		jumpRealTrail.clear();
 		jumpRealTrailBase = 0;
 		jumpState = "running";
@@ -392,11 +399,15 @@ public final class BotController {
 			completed.add(record);
 		o.add("completedEdges", completed);
 		// Batch 4, record-only prediction evidence.
+		if (jumpPredictionFirst != null)
+			o.add("predictionFirst", jumpPredictionFirst);
 		if (jumpPredictionNow != null)
 			o.add("predictionNow", jumpPredictionNow);
 		if (jumpPredictionWait != null)
 			o.add("predictionWait", jumpPredictionWait);
+		o.addProperty("waitTicks", jumpWaitTicks);
 		o.addProperty("realTrailBase", jumpRealTrailBase);
+		o.addProperty("takeoffTrace", jumpTakeoffTrace);
 		JsonArray realTrail = new JsonArray();
 		for (JsonObject entry : jumpRealTrail)
 			realTrail.add(entry);
@@ -516,30 +527,52 @@ public final class BotController {
 			return;
 		}
 		if (!jumpTakeoffIssued && p.onGround()) {
-			// Take off only from a settled stand. The settle that centred the
-			// previous landing leaves a residual velocity, and a hop that starts
-			// with it flies off-axis: the input acceleration (0.098/tick) cannot
-			// redirect a walk-speed drift, and the chain's next block is one
-			// block wide (live chain run: the hop drifted east into the gap).
-			// Waiting for friction to kill the drift and then jumping from the
-			// centre keeps the flight on the aimed bearing.
-			double speed = Math.hypot(p.getDeltaMovement().x, p.getDeltaMovement().z);
-			if (speed > JUMP_TAKEOFF_MAX_SPEED) {
-				releaseHorizontal(p);
+			// Only the *lateral* velocity is harmful: a drift across the flight
+			// line cannot be corrected in the air (0.098/tick of input), while
+			// the along-component is a walking run-up that lengthens the hop.
+			// Gating on total speed forced standstill takeoffs, which fall short
+			// of a step the walking hop clears (live hill run: the predictor
+			// refused a takeoff the walking bot had been making).
+			double lateral = -p.getDeltaMovement().x * jumpDirZ + p.getDeltaMovement().z * jumpDirX;
+			if (Math.abs(lateral) > JUMP_TAKEOFF_MAX_SPEED) {
+				holdPosition(p);
 				return;
 			}
 			if (passed >= -jumpTakeoffRadius) {
-				// Batch 4, record-only: predict this takeoff and the one-tick
-				// wait before touching the keys. The real trail is captured per
-				// tick below; the two are compared offline, and only after they
-				// agree may a prediction choose the takeoff.
+				// Batch 4 decision, re-evaluated every tick (the expert's
+				// "execute one tick, predict again"): jump when the takeoff is
+				// predicted to land on the destination support, hold while the
+				// wait option is better, and fail honestly when neither can land
+				// safely instead of walking off the edge (the pillar-clipped
+				// chain hop predicts no safe takeoff).
+				JumpPredictor.Result now = JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8);
+				JumpPredictor.Result wait = JumpPredictor.simulate(p, 1, 0, false, jumpTargetX, jumpTargetZ, 24, 8);
+				double nowScore = takeoffScore(now);
+				double waitScore = takeoffScore(wait);
 				if (jumpPredictionNow == null) {
-					jumpPredictionNow = JumpPredictor.toJson(
-							JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8), 26);
-					jumpPredictionWait = JumpPredictor.toJson(
-							JumpPredictor.simulate(p, 1, 0, false, jumpTargetX, jumpTargetZ, 24, 8), 26);
+					jumpPredictionNow = JumpPredictor.toJson(now, 26);
+					jumpPredictionFirst = jumpPredictionNow;
+					jumpPredictionWait = JumpPredictor.toJson(wait, 26);
 					jumpRealTrailBase = jumpTicks;
+					debugTakeoff(p, now, wait, nowScore, waitScore);
 				}
+				if (!Double.isFinite(nowScore) && !Double.isFinite(waitScore)) {
+					jumpWaitTicks++;
+					if (jumpWaitTicks > JUMP_TAKEOFF_WAIT_MAX) {
+						finishJump("failed", "no_safe_takeoff");
+						return;
+					}
+					holdPosition(p);
+					return;
+				}
+				if (Double.isFinite(waitScore) && (!Double.isFinite(nowScore) || waitScore < nowScore)) {
+					jumpWaitTicks++;
+					holdPosition(p);
+					return;
+				}
+				// The executed takeoff's own prediction replaces the first
+				// snapshot, so the evidence matches the flight that happened.
+				jumpPredictionNow = JumpPredictor.toJson(now, 26);
 				jumpTakeoffIssued = true;
 				jumpPhase = "takeoff";
 				pressHorizontal(true);
@@ -673,6 +706,52 @@ public final class BotController {
 		entry.addProperty("onGround", p.onGround());
 		entry.addProperty("phase", jumpPhase);
 		jumpRealTrail.add(entry);
+	}
+
+	/**
+	 * Scores one predicted takeoff option; not finite means "do not use".
+	 *
+	 * A safe option comes to rest on a support at the destination level and as
+	 * close to the handoff target as possible. A landing below the target (the
+	 * bot would stand against the step instead of climbing it) or one that
+	 * slides off is refused, which is what makes the pillar-clipped hop fail
+	 * fast instead of dropping the bot.
+	 */
+	private double takeoffScore(JumpPredictor.Result prediction) {
+		if (prediction.landTick < 0 || !prediction.staysOnSupport)
+			return Double.NaN;
+		if (Math.abs(prediction.restY - jumpTargetY) > 0.35)
+			return Double.NaN;
+		return prediction.restToTarget;
+	}
+
+	/** Compact takeoff-decision trace for the live diagnosis. */
+	private void debugTakeoff(LocalPlayer p, JumpPredictor.Result now, JumpPredictor.Result wait, double nowScore, double waitScore) {
+		jumpTakeoffTrace = "now=" + (Double.isFinite(nowScore) ? String.format(java.util.Locale.ROOT, "%.3f", nowScore) : "unsafe")
+				+ " wait=" + (Double.isFinite(waitScore) ? String.format(java.util.Locale.ROOT, "%.3f", waitScore) : "unsafe")
+				+ " pos=" + String.format(java.util.Locale.ROOT, "%.2f,%.2f,%.2f", p.getX(), p.getY(), p.getZ())
+				+ " nowLand=" + (now.landTick >= 0 ? String.format(java.util.Locale.ROOT, "%.2f,%.2f,%.2f", now.landX, now.landY, now.landZ) : "none")
+				+ " waitLand=" + (wait.landTick >= 0 ? String.format(java.util.Locale.ROOT, "%.2f,%.2f,%.2f", wait.landX, wait.landY, wait.landZ) : "none");
+	}
+
+	private volatile String jumpTakeoffTrace = "";
+
+	/**
+	 * Stops the bot without walking toward an unprotected edge.
+	 *
+	 * A refusal or a wait that drifts off a one-block source is how the bot fell
+	 * on the pillar hop while the prediction had already refused the takeoff:
+	 * the counter-thrust faces the drift, so the stop happens in place.
+	 */
+	private void holdPosition(LocalPlayer p) {
+		double vx = p.getDeltaMovement().x;
+		double vz = p.getDeltaMovement().z;
+		if (Math.hypot(vx, vz) <= JUMP_TAKEOFF_MAX_SPEED) {
+			releaseHorizontal(p);
+			return;
+		}
+		aimAtPoint(p, p.getX() + vx, p.getY(), p.getZ() + vz);
+		pressHorizontal(false);
 	}
 
 	private static double stopDistance(double x, double z, double centreX, double centreZ) {
