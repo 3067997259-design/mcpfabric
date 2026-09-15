@@ -202,6 +202,10 @@ public final class BotController {
 	private double jumpPredictedX, jumpPredictedZ;
 	/** Consecutive stable ticks that end a lone-pad settle. */
 	private static final int JUMP_SETTLE_STABLE_TICKS = 2;
+	/** Bound on centring a landing before handing over to the next edge. */
+	private static final int JUMP_HANDOFF_SETTLE_TICKS = 12;
+	/** Drift above which the takeoff waits for friction to stop the bot. */
+	private static final double JUMP_TAKEOFF_MAX_SPEED = 0.06;
 	private int jumpStableTicks;
 	/**
 	 * State-machine facts for one jump edge.
@@ -253,17 +257,32 @@ public final class BotController {
 	/** `stop` at the destination, `continue` into the queued next edge. */
 	private volatile String jumpIntent = "stop";
 	private double jumpFromX, jumpFromY, jumpFromZ;
-	/** The edge after this one, executed without a host round trip. */
-	private JumpEdge jumpNextEdge;
+	/**
+	 * Edges waiting behind the active one (Step 3 batch 3).
+	 *
+	 * A climbing chain is submitted as one list, so the mod hands over at every
+	 * touchdown and the host never re-submits between hops (that round trip let
+	 * the bot slide). The host tops the queue up only when it runs low.
+	 */
+	private final List<JumpEdge> jumpQueue = new ArrayList<>();
 	private volatile String jumpNextEdgeId = "";
 	/** Completed edges of the running task, as `edgeId@x,y,z|vx,vz`. */
 	private final List<String> jumpCompletedEdges = new ArrayList<>();
 	private volatile int jumpCompletedCount;
 
-	public synchronized JsonObject startJump(JumpEdge edge, JumpEdge next, String landingIntent, long deadlineMillis) {
-		applyEdge(edge);
-		jumpNextEdge = next;
-		jumpNextEdgeId = next != null && next.edgeId != null ? next.edgeId : "";
+	/**
+	 * Starts one climb: the first edge becomes active, the rest queue behind it.
+	 *
+	 * @param edges at least one edge; each is executed after the previous one
+	 * reports its real touchdown, with no host round trip in between.
+	 */
+	public synchronized JsonObject startJump(List<JumpEdge> edges, String landingIntent, long deadlineMillis) {
+		if (edges == null || edges.isEmpty())
+			throw new IllegalArgumentException("startJump needs at least one edge");
+		jumpQueue.clear();
+		jumpQueue.addAll(edges);
+		applyEdge(jumpQueue.remove(0));
+		jumpNextEdgeId = jumpQueue.isEmpty() ? "" : jumpQueue.get(0).edgeId;
 		jumpIntent = landingIntent == null || landingIntent.isEmpty() ? "stop" : landingIntent;
 		jumpDeadline = deadlineMillis;
 		jumpTicks = 0;
@@ -272,6 +291,14 @@ public final class BotController {
 		jumpCompletedCount = 0;
 		jumpState = "running";
 		jumpEndReason = "running";
+		return jumpStatusJson();
+	}
+
+	/** Adds edges behind the active one; the host tops the queue up with this. */
+	public synchronized JsonObject appendJump(List<JumpEdge> edges) {
+		if (edges != null)
+			jumpQueue.addAll(edges);
+		jumpNextEdgeId = jumpQueue.isEmpty() ? "" : jumpQueue.get(0).edgeId;
 		return jumpStatusJson();
 	}
 
@@ -419,25 +446,22 @@ public final class BotController {
 			// the old direction is the case that slides a one-block chain off its
 			// edge: kill that velocity first, then hand over. A straight
 			// continuation keeps its speed.
-			if (jumpNextEdge != null && jumpIntent.equals("continue")) {
+			if (!jumpQueue.isEmpty() && jumpIntent.equals("continue")) {
 				jumpPhase = "handoff";
-				JumpEdge next = jumpNextEdge;
-				double nextLength = Math.sqrt(next.dirX * next.dirX + next.dirZ * next.dirZ);
-				double nextDirX = nextLength < 1e-6 ? 0 : next.dirX / nextLength;
-				double nextDirZ = nextLength < 1e-6 ? 0 : next.dirZ / nextLength;
-				double cos = jumpDirX * nextDirX + jumpDirZ * nextDirZ;
-				double speed = Math.hypot(p.getDeltaMovement().x, p.getDeltaMovement().z);
-				if (cos < 0.5 && speed > 0.08) {
-					releaseHorizontal(p);
+				// Hand over only from a settled stand: the next edge is one block
+				// wide, and a handoff at 0.6 off centre with residual velocity
+				// slid the bot off the chain (live chain run). The settle below
+				// runs in this edge's frame, bounded, and keeps the next edge
+				// queued until the bot is parked.
+				if (settleJump(p, true))
 					return;
-				}
-				jumpNextEdge = null;
-				jumpNextEdgeId = "";
+				JumpEdge next = jumpQueue.remove(0);
+				jumpNextEdgeId = jumpQueue.isEmpty() ? "" : jumpQueue.get(0).edgeId;
 				applyEdge(next);
 				return;
 			}
 			jumpPhase = "settle";
-			settleJump(p);
+			settleJump(p, false);
 			return;
 		}
 		if (p.getY() < jumpTargetY - jumpFallTolerance) {
@@ -466,12 +490,26 @@ public final class BotController {
 			jumpHeld = true;
 			return;
 		}
-		if (!jumpTakeoffIssued && p.onGround() && passed >= -jumpTakeoffRadius) {
-			jumpTakeoffIssued = true;
-			jumpPhase = "takeoff";
-			pressHorizontal(true);
-			jumpHeld = true;
-			return;
+		if (!jumpTakeoffIssued && p.onGround()) {
+			// Take off only from a settled stand. The settle that centred the
+			// previous landing leaves a residual velocity, and a hop that starts
+			// with it flies off-axis: the input acceleration (0.098/tick) cannot
+			// redirect a walk-speed drift, and the chain's next block is one
+			// block wide (live chain run: the hop drifted east into the gap).
+			// Waiting for friction to kill the drift and then jumping from the
+			// centre keeps the flight on the aimed bearing.
+			double speed = Math.hypot(p.getDeltaMovement().x, p.getDeltaMovement().z);
+			if (speed > JUMP_TAKEOFF_MAX_SPEED) {
+				releaseHorizontal(p);
+				return;
+			}
+			if (passed >= -jumpTakeoffRadius) {
+				jumpTakeoffIssued = true;
+				jumpPhase = "takeoff";
+				pressHorizontal(true);
+				jumpHeld = true;
+				return;
+			}
 		}
 		// The flight keeps its forward press: releasing mid-air barely changes
 		// the velocity and made hops land short of their pad. All stop control
@@ -493,10 +531,12 @@ public final class BotController {
 	 * one tick before deciding again. Touched down, stopped and ready-to-continue
 	 * stay separate verdicts.
 	 */
-	private void settleJump(LocalPlayer p) {
+	private boolean settleJump(LocalPlayer p, boolean advanceOnParked) {
 		double centreX = Math.floor(jumpTargetX) + 0.5;
 		double centreZ = Math.floor(jumpTargetZ) + 0.5;
-		jumpZone = jumpBrake ? JUMP_PARK_ZONE_TIGHT : JUMP_PARK_ZONE_WIDE;
+		// A handoff only needs the bot safely inside the block (wide zone); the
+		// final stop is what the tight zone is for.
+		jumpZone = advanceOnParked || !jumpBrake ? JUMP_PARK_ZONE_WIDE : JUMP_PARK_ZONE_TIGHT;
 		double normalX = -jumpDirZ;
 		double normalZ = jumpDirX;
 		double vx = p.getDeltaMovement().x;
@@ -506,7 +546,7 @@ public final class BotController {
 		jumpLateralError = (p.getX() - centreX) * normalX + (p.getZ() - centreZ) * normalZ;
 		jumpSettleTicks++;
 
-		double stopSpeed = jumpBrake ? 0.02 : JUMP_SETTLE_SPEED;
+		double stopSpeed = advanceOnParked ? JUMP_SETTLE_SPEED : jumpBrake ? 0.02 : JUMP_SETTLE_SPEED;
 		boolean parked = Math.abs(p.getX() - centreX) <= jumpZone
 				&& Math.abs(p.getZ() - centreZ) <= jumpZone
 				&& speed <= stopSpeed;
@@ -514,20 +554,25 @@ public final class BotController {
 			jumpStableTicks++;
 			if (jumpStableTicks >= JUMP_SETTLE_STABLE_TICKS) {
 				stopAllMovement();
+				if (advanceOnParked)
+					return false;
 				finishJump("done", "landed");
-				return;
+				return true;
 			}
 			releaseHorizontal(p);
-			return;
+			return true;
 		}
 		jumpStableTicks = 0;
+		int cap = advanceOnParked ? JUMP_HANDOFF_SETTLE_TICKS : JUMP_SETTLE_MAX_TICKS;
 		// The settle is bounded: a controller that cannot centre the bot must not
 		// report failure for a landing that is already on the pad, so the cap
 		// accepts the measured position when it is inside the host's tolerance.
-		if (jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS && Math.hypot(jumpAlongError, jumpLateralError) <= 0.5) {
+		if (jumpSettleTicks >= cap && Math.hypot(jumpAlongError, jumpLateralError) <= 0.5) {
 			stopAllMovement();
+			if (advanceOnParked)
+				return false;
 			finishJump("done", "landed");
-			return;
+			return true;
 		}
 
 		// Coasting: where a release comes to rest.
@@ -570,6 +615,7 @@ public final class BotController {
 		jumpPredictedStop = Math.hypot(bestX - centreX, bestZ - centreZ);
 		aimAlongFlight(p);
 		applySettleInput(bestForward, bestStrafe);
+		return true;
 	}
 
 	private static double stopDistance(double x, double z, double centreX, double centreZ) {

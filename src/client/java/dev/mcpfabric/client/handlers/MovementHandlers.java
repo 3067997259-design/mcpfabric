@@ -1,8 +1,9 @@
 package dev.mcpfabric.client.handlers;
 
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import dev.mcpfabric.McpFabric;
-import dev.mcpfabric.bridge.RpcContext;
 import dev.mcpfabric.bridge.RpcException;
 import dev.mcpfabric.bridge.RpcRouter;
 import dev.mcpfabric.client.BotController;
@@ -10,6 +11,9 @@ import dev.mcpfabric.client.ClientMc;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * MC-4e advanced movement: the riptide launch.
@@ -32,11 +36,16 @@ public final class MovementHandlers {
 			requireControl();
 			long deadlineMs = ctx.optLong("deadlineMs", System.currentTimeMillis() + 8_000);
 			String landingIntent = ctx.optString("landingIntent", "stop");
-			BotController.JumpEdge edge = jumpEdgeOf(ctx, "");
-			// Optional second edge: executed in the same task, so no host round
-			// trip sits between the hops.
-			BotController.JumpEdge next = ctx.has("nextTargetX") ? jumpEdgeOf(ctx, "next") : null;
-			return ClientMc.call(() -> BotController.get().startJump(edge, next, landingIntent, deadlineMs));
+			List<BotController.JumpEdge> edges = jumpEdgesOf(ctx.getString("edgesJson"));
+			if (edges.isEmpty())
+				throw RpcException.badRequest("edgesJson must hold at least one edge.");
+			return ClientMc.call(() -> BotController.get().startJump(edges, landingIntent, deadlineMs));
+		});
+
+		router.register("movement.jumpAppend", ctx -> {
+			requireControl();
+			List<BotController.JumpEdge> edges = jumpEdgesOf(ctx.getString("edgesJson"));
+			return ClientMc.call(() -> BotController.get().appendJump(edges));
 		});
 
 		router.register("movement.jumpStatus", ctx -> ClientMc.call(() -> BotController.get().jumpStatusJson()));
@@ -87,30 +96,42 @@ public final class MovementHandlers {
 	}
 
 	/**
-	 * Reads one jump edge from the request.
+	 * Parses a JSON array of jump edges.
 	 *
-	 * @param prefix empty for the first edge, `next` for the queued one: the
-	 * second edge carries the same fields with a `next` prefix.
+	 * A climbing chain is one list, so the wire shape is an array rather than
+	 * repeated prefixed parameters; the host owns the planner and serializes it.
 	 */
-	private static BotController.JumpEdge jumpEdgeOf(RpcContext ctx, String prefix) throws RpcException {
-		boolean next = !prefix.isEmpty();
-		BotController.JumpEdge edge = new BotController.JumpEdge();
-		edge.edgeId = ctx.optString(next ? "nextEdgeId" : "edgeId", "");
-		edge.fromX = ctx.optDouble("fromX", 0);
-		edge.fromY = ctx.optDouble("fromY", 0);
-		edge.fromZ = ctx.optDouble("fromZ", 0);
-		edge.targetX = ctx.getDouble(next ? "nextTargetX" : "targetX");
-		edge.targetY = ctx.getDouble(next ? "nextTargetY" : "targetY");
-		edge.targetZ = ctx.getDouble(next ? "nextTargetZ" : "targetZ");
-		edge.takeoffX = ctx.getDouble(next ? "nextTakeoffX" : "takeoffX");
-		edge.takeoffZ = ctx.getDouble(next ? "nextTakeoffZ" : "takeoffZ");
-		edge.dirX = ctx.getDouble(next ? "nextDirX" : "dirX");
-		edge.dirZ = ctx.getDouble(next ? "nextDirZ" : "dirZ");
-		edge.sprint = ctx.optBool("sprint", false);
-		edge.brake = ctx.optBool("brake", false);
-		edge.takeoffRadius = ctx.optDouble("takeoffRadius", 0.35);
-		edge.landingRadius = ctx.optDouble("landingRadius", 0.7);
-		return edge;
+	private static List<BotController.JumpEdge> jumpEdgesOf(String json) {
+		List<BotController.JumpEdge> edges = new ArrayList<>();
+		for (JsonElement element : JsonParser.parseString(json).getAsJsonArray()) {
+			JsonObject object = element.getAsJsonObject();
+			BotController.JumpEdge edge = new BotController.JumpEdge();
+			edge.edgeId = optString(object, "edgeId", "");
+			edge.fromX = optDouble(object, "fromX", 0);
+			edge.fromY = optDouble(object, "fromY", 0);
+			edge.fromZ = optDouble(object, "fromZ", 0);
+			edge.targetX = optDouble(object, "targetX", 0);
+			edge.targetY = optDouble(object, "targetY", 0);
+			edge.targetZ = optDouble(object, "targetZ", 0);
+			edge.takeoffX = optDouble(object, "takeoffX", 0);
+			edge.takeoffZ = optDouble(object, "takeoffZ", 0);
+			edge.dirX = optDouble(object, "dirX", 0);
+			edge.dirZ = optDouble(object, "dirZ", 0);
+			edge.sprint = object.has("sprint") && object.get("sprint").getAsBoolean();
+			edge.brake = object.has("brake") && object.get("brake").getAsBoolean();
+			edge.takeoffRadius = optDouble(object, "takeoffRadius", 0.35);
+			edge.landingRadius = optDouble(object, "landingRadius", 0.7);
+			edges.add(edge);
+		}
+		return edges;
+	}
+
+	private static String optString(JsonObject object, String key, String fallback) {
+		return object.has(key) && !object.get(key).isJsonNull() ? object.get(key).getAsString() : fallback;
+	}
+
+	private static double optDouble(JsonObject object, String key, double fallback) {
+		return object.has(key) && !object.get(key).isJsonNull() ? object.get(key).getAsDouble() : fallback;
 	}
 
 	private static void requireControl() throws RpcException {
