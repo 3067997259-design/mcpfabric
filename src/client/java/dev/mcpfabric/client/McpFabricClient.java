@@ -15,6 +15,7 @@ import dev.mcpfabric.client.handlers.MineHandlers;
 import dev.mcpfabric.client.handlers.MovementHandlers;
 import dev.mcpfabric.client.handlers.NavHandlers;
 import dev.mcpfabric.client.handlers.PlayerLifeHandlers;
+import dev.mcpfabric.client.handlers.VehicleHandlers;
 import dev.mcpfabric.client.handlers.VisionHandlers;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -43,6 +44,7 @@ public class McpFabricClient implements ClientModInitializer {
 		PlayerLifeHandlers.register(router);
 		CombatHandlers.register(router);
 		MovementHandlers.register(router);
+		VehicleHandlers.register(router);
 		VisionHandlers.register(router);
 		NavHandlers.register(router);
 		ClientChatHandlers.register(router); // client variant of chat.send (speaks as local player)

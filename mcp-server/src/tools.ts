@@ -388,6 +388,36 @@ export const TOOLS: ToolDef[] = [
     annotations: WRITE,
   },
   {
+    name: "get_vehicle_state",
+    method: "vehicle.observe",
+    title: "Observe one vehicle",
+    description:
+      "Client-only. Concrete state of one rideable by uuid: type, position, motion, yaw, bounds, passengers/controller, free flag, plus horse/donkey/mule tamed+saddled+owner+health+jumpStrength+controlledByPassenger, boat in-water+paddle side, or minecart speed+rail shape+powered+onRail. Returns absence=out-of-range when the entity is not loaded.",
+    inputSchema: { uuid: z.string().describe("Entity UUID of the vehicle to observe.") },
+    annotations: READ,
+  },
+  {
+    name: "get_vehicles",
+    method: "vehicle.query",
+    title: "Query nearby vehicles",
+    description:
+      "Client-only. List rideables near the player with their concrete state (same fields as get_vehicle_state). Optional kind filter: boat, minecart, horse (horse/donkey/mule, never camel), or horse-family.",
+    inputSchema: {
+      radius: z.number().min(1).max(32).optional().default(8).describe("Search radius in blocks."),
+      kind: z.string().optional().describe("Concrete kind filter: boat, minecart, horse, or horse-family."),
+    },
+    annotations: READ,
+  },
+  {
+    name: "board_vehicle_uuid",
+    method: "vehicle.boardUuid",
+    title: "Board a vehicle by uuid",
+    description:
+      "Client-only. Right-click exactly one vehicle entity by uuid to mount it. Never picks a nearby object of another type. Reports boarded=false when the entity is absent or not rideable.",
+    inputSchema: { uuid: z.string().describe("Entity UUID of the vehicle to board.") },
+    annotations: WRITE,
+  },
+  {
     name: "get_equipment",
     method: "player.getEquipment",
     title: "Get equipment",
