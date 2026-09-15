@@ -200,6 +200,16 @@ public final class BotController {
 	private double jumpLateralError;
 	private double jumpZone;
 	private double jumpPredictedX, jumpPredictedZ;
+	/**
+	 * Batch 4 prediction record, taken at the takeoff decision.
+	 *
+	 * <p>Recorded before any key changes and never used to choose inputs yet:
+	 * the predicted trails are aligned against the real per-tick trail first.
+	 */
+	private JsonObject jumpPredictionNow;
+	private JsonObject jumpPredictionWait;
+	private final List<JsonObject> jumpRealTrail = new ArrayList<>();
+	private int jumpRealTrailBase;
 	/** Consecutive stable ticks that end a lone-pad settle. */
 	private static final int JUMP_SETTLE_STABLE_TICKS = 2;
 	/** Bound on centring a landing before handing over to the next edge. */
@@ -289,6 +299,10 @@ public final class BotController {
 		jumpPredictedStop = 0;
 		jumpCompletedEdges.clear();
 		jumpCompletedCount = 0;
+		jumpPredictionNow = null;
+		jumpPredictionWait = null;
+		jumpRealTrail.clear();
+		jumpRealTrailBase = 0;
 		jumpState = "running";
 		jumpEndReason = "running";
 		return jumpStatusJson();
@@ -377,6 +391,16 @@ public final class BotController {
 		for (String record : jumpCompletedEdges)
 			completed.add(record);
 		o.add("completedEdges", completed);
+		// Batch 4, record-only prediction evidence.
+		if (jumpPredictionNow != null)
+			o.add("predictionNow", jumpPredictionNow);
+		if (jumpPredictionWait != null)
+			o.add("predictionWait", jumpPredictionWait);
+		o.addProperty("realTrailBase", jumpRealTrailBase);
+		JsonArray realTrail = new JsonArray();
+		for (JsonObject entry : jumpRealTrail)
+			realTrail.add(entry);
+		o.add("realTrail", realTrail);
 		JsonObject from = new JsonObject();
 		from.addProperty("x", jumpFromX);
 		from.addProperty("y", jumpFromY);
@@ -429,6 +453,7 @@ public final class BotController {
 			finishJump("failed", "no_player");
 			return;
 		}
+		recordRealTrail(p);
 		if (System.currentTimeMillis() > jumpDeadline) {
 			finishJump("failed", "deadline");
 			return;
@@ -504,6 +529,17 @@ public final class BotController {
 				return;
 			}
 			if (passed >= -jumpTakeoffRadius) {
+				// Batch 4, record-only: predict this takeoff and the one-tick
+				// wait before touching the keys. The real trail is captured per
+				// tick below; the two are compared offline, and only after they
+				// agree may a prediction choose the takeoff.
+				if (jumpPredictionNow == null) {
+					jumpPredictionNow = JumpPredictor.toJson(
+							JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8), 26);
+					jumpPredictionWait = JumpPredictor.toJson(
+							JumpPredictor.simulate(p, 1, 0, false, jumpTargetX, jumpTargetZ, 24, 8), 26);
+					jumpRealTrailBase = jumpTicks;
+				}
 				jumpTakeoffIssued = true;
 				jumpPhase = "takeoff";
 				pressHorizontal(true);
@@ -616,6 +652,27 @@ public final class BotController {
 		aimAlongFlight(p);
 		applySettleInput(bestForward, bestStrafe);
 		return true;
+	}
+
+	/**
+	 * Records the real state for this tick, phase included.
+	 *
+	 * The entry is taken before this tick's keys take effect, so a consumer
+	 * aligns it with the prediction's first simulated tick by one offset.
+	 */
+	private void recordRealTrail(LocalPlayer p) {
+		if (jumpRealTrail.size() >= 48)
+			return;
+		JsonObject entry = new JsonObject();
+		entry.addProperty("tick", jumpTicks);
+		entry.addProperty("x", p.getX());
+		entry.addProperty("y", p.getY());
+		entry.addProperty("z", p.getZ());
+		entry.addProperty("vx", p.getDeltaMovement().x);
+		entry.addProperty("vz", p.getDeltaMovement().z);
+		entry.addProperty("onGround", p.onGround());
+		entry.addProperty("phase", jumpPhase);
+		jumpRealTrail.add(entry);
 	}
 
 	private static double stopDistance(double x, double z, double centreX, double centreZ) {
