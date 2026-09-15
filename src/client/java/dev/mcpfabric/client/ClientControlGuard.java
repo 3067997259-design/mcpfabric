@@ -1,0 +1,79 @@
+package dev.mcpfabric.client;
+
+import dev.mcpfabric.McpFabric;
+import dev.mcpfabric.client.reflex.ReflexController;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+
+/**
+ * P1 cleanup guard: releases every control surface when the world, the
+ * connection, the player, or the bridge heartbeat disappears.
+ *
+ * Cleanup is self-contained on the game side: it never waits for AIRI to send
+ * a stop request. Movement intent clears immediately; key releases and item
+ * stops are applied on the next client tick (within two game ticks).
+ */
+public final class ClientControlGuard {
+	private ClientControlGuard() {}
+
+	private static boolean wasDead;
+	private static boolean hadLevel;
+	private static long lastSeenRequestAt;
+
+	public static void register() {
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+			// A new connection is the reconnect signal: arm the controller and
+			// refresh the heartbeat baseline.
+			wasDead = false;
+			lastSeenRequestAt = System.currentTimeMillis();
+		});
+		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+			BotController.get().clearAll("disconnected");
+			hadLevel = false;
+		});
+
+		ClientTickEvents.END_CLIENT_TICK.register(ClientControlGuard::onTick);
+	}
+
+	private static void onTick(Minecraft mc) {
+		LocalPlayer p = mc.player;
+
+		// Returning to the title screen fires no disconnect event.
+		if (hadLevel && mc.level == null) {
+			BotController.get().clearAll("world_exit");
+			hadLevel = false;
+		}
+		else if (mc.level != null) {
+			hadLevel = true;
+		}
+
+		// One cleanup per death transition.
+		boolean dead = p != null && (p.isDeadOrDying() || p.getHealth() <= 0.0F);
+		if (dead && !wasDead) {
+			BotController.get().clearAll("death");
+		}
+		wasDead = dead;
+
+		// Survival reflexes (mc-0d) run before the BotController applies input
+		// state this tick, so an escape/reaction takes effect immediately.
+		ReflexController.get().onClientTick(mc);
+
+		// Bridge heartbeat: no request for too long while controls are held.
+		long timeout = McpFabric.config().heartbeatTimeoutMs;
+		if (timeout <= 0) {
+			return;
+		}
+		long now = System.currentTimeMillis();
+		long lastRequest = McpFabric.router() != null ? McpFabric.router().lastRequestAt() : now;
+		if (lastRequest != lastSeenRequestAt) {
+			lastSeenRequestAt = lastRequest;
+		}
+		else if (BotController.get().isDriving() && now - lastSeenRequestAt > timeout) {
+			BotController.get().clearAll("bridge_timeout");
+			// Avoid clearing on every silent tick.
+			lastSeenRequestAt = now;
+		}
+	}
+}

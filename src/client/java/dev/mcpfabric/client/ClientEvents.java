@@ -20,10 +20,13 @@ public final class ClientEvents {
 			JsonObject d = new JsonObject();
 			d.addProperty("text", message.getString());
 			if (sender != null) {
+				// MC-3c X-10: the game host drops its own chat echo by uuid.
 				//? if <1.21.9 {
 				d.addProperty("sender", sender.getName());
+				d.addProperty("uuid", sender.getId().toString());
 				//?} else
-				/*d.addProperty("sender", sender.name());*/
+				/*d.addProperty("sender", sender.name());
+				d.addProperty("uuid", sender.id().toString());*/
 			}
 			events.emit("chat", d);
 		});

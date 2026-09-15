@@ -6,7 +6,10 @@ import dev.mcpfabric.bridge.RpcRouter;
 import dev.mcpfabric.client.BotController;
 import dev.mcpfabric.client.ClientMc;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.ItemStack;
 
 /** Movement and look control for the local player. */
 public final class ControlHandlers {
@@ -61,15 +64,44 @@ public final class ControlHandlers {
 		}));
 
 		router.register("control.startUsing", ctx -> ClientMc.call(() -> {
+			LocalPlayer p = ClientMc.player();
+			BotController.get().setUseHeld(true);
 			ClientMc.mc().options.keyUse.setDown(true);
-			return Json.ok("using");
+			// Key state alone never raises a click, so the first use must be
+			// explicit; the same pattern the eat reflex uses.
+			ClientMc.gameMode().useItem(p, InteractionHand.MAIN_HAND);
+			return usingState(p);
+		}));
+
+		router.register("control.releaseUsing", ctx -> ClientMc.call(() -> {
+			LocalPlayer p = ClientMc.player();
+			ClientMc.mc().options.keyUse.setDown(false);
+			BotController.get().setUseHeld(false);
+			// Normal release: `releaseUsingItem` fires chargeables
+			// (bow/crossbow/trident) and finishes food use.
+			ClientMc.gameMode().releaseUsingItem(p);
+			return usingState(p);
 		}));
 
 		router.register("control.stopUsing", ctx -> ClientMc.call(() -> {
+			LocalPlayer p = ClientMc.player();
 			ClientMc.mc().options.keyUse.setDown(false);
-			ClientMc.player().stopUsingItem();
-			return Json.ok("stopped using");
+			BotController.get().setUseHeld(false);
+			// Abort: `stopUsingItem` clears the use without firing chargeables.
+			p.stopUsingItem();
+			return usingState(p);
 		}));
+	}
+
+	/** The live use state, shared by start/release/stop so each path reports the same shape. */
+	private static JsonObject usingState(LocalPlayer p) {
+		JsonObject o = new JsonObject();
+		o.addProperty("using", p.isUsingItem());
+		o.addProperty("usingTicks", p.getTicksUsingItem());
+		o.addProperty("usingHand", p.getUsedItemHand().name().toLowerCase());
+		ItemStack use = p.getUseItem();
+		o.addProperty("usingItemId", use.isEmpty() ? "" : BuiltInRegistries.ITEM.getKey(use.getItem()).toString());
+		return o;
 	}
 
 	private static void applyLook(LocalPlayer p, float yaw, float pitch) {

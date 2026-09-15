@@ -36,10 +36,22 @@ public final class NavHandlers {
 			AStarPathfinder pf = new AStarPathfinder(level, NODE_BUDGET);
 			List<BlockPos> path = pf.findPath(start, goal, reach);
 			if (path == null || path.isEmpty()) {
-				throw RpcException.notFound("No path found to target within the search budget (try a closer/standable target).");
+				// P2: bounded failure carries the measured position so the caller
+				// can report where the attempt stopped, not just that it failed.
+				JsonObject data = new JsonObject();
+				data.addProperty("reason", "unreachable");
+				JsonObject pos = new JsonObject();
+				pos.addProperty("x", p.getX());
+				pos.addProperty("y", p.getY());
+				pos.addProperty("z", p.getZ());
+				data.add("position", pos);
+				throw new RpcException("unreachable", "No path found to target within the search budget (try a closer/standable target).", data);
 			}
 			long deadline = System.currentTimeMillis() + timeout * 1000L;
-			BotController.get().startNavigation(path, goal, reach, sprint, deadline);
+			// Optional correlation id; reflex events echo it when they preempt
+			// this navigation (mc-0d).
+			String commandId = ctx.optString("commandId", null);
+			BotController.get().startNavigation(path, goal, reach, sprint, deadline, commandId);
 
 			JsonObject o = new JsonObject();
 			o.addProperty("started", true);
@@ -55,7 +67,7 @@ public final class NavHandlers {
 		router.register("nav.status", ctx -> ClientMc.call(() -> BotController.get().statusJson()));
 
 		router.register("nav.stop", ctx -> {
-			BotController.get().stopNavigation("stopped");
+			BotController.get().stopNavigation("cancelled");
 			BotController.get().stopAllMovement();
 			return Json.ok("navigation stopped");
 		});
