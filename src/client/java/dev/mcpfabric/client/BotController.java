@@ -168,9 +168,17 @@ public final class BotController {
 	private int jumpTicks;
 	/** Ground friction speed retention, used by the settling stop estimate. */
 	private static final double GROUND_SPEED_RETENTION = 0.546;
-	/** A lone-pad landing is settled inside this centre error and speed. */
-	private static final double JUMP_SETTLE_CENTER = 0.15;
-	private static final double JUMP_SETTLE_SPEED = 0.02;
+	/**
+	 * A lone-pad landing is settled inside this centre error and speed.
+	 *
+	 * The window is wider than the 0.15/0.02 the offline recurrence suggested:
+	 * a bang-bang controller with that window oscillated around the centre at
+	 * walking speed and ran into the settle cap short of it (live run: 0.55
+	 * short). 0.3 of a 0.5 half-width still leaves the whole footprint on the
+	 * pad, and the host's goal tolerance accepts it.
+	 */
+	private static final double JUMP_SETTLE_CENTER = 0.3;
+	private static final double JUMP_SETTLE_SPEED = 0.1;
 	/** Consecutive stable ticks that end a lone-pad settle. */
 	private static final int JUMP_SETTLE_STABLE_TICKS = 2;
 	private int jumpStableTicks;
@@ -302,6 +310,16 @@ public final class BotController {
 			double vAlong = p.getDeltaMovement().x * jumpDirX + p.getDeltaMovement().z * jumpDirZ;
 			jumpPredictedStop = along + vAlong / (1 - GROUND_SPEED_RETENTION);
 			if (jumpBrake) {
+				jumpSettleTicks++;
+				// The settle is bounded: a controller that cannot centre the bot
+				// must not report failure for a landing that is already on the
+				// pad, so the cap accepts the measured position when it is
+				// inside the host's goal tolerance.
+				if (jumpSettleTicks >= JUMP_SETTLE_MAX_TICKS && Math.abs(along) <= 0.5) {
+					stopAllMovement();
+					finishJump("done", "landed");
+					return;
+				}
 				if (Math.abs(along) <= JUMP_SETTLE_CENTER && Math.abs(vAlong) <= JUMP_SETTLE_SPEED) {
 					jumpStableTicks++;
 					if (jumpStableTicks >= JUMP_SETTLE_STABLE_TICKS) {
