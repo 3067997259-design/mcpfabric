@@ -489,6 +489,15 @@ export const TOOLS: ToolDef[] = [
     annotations: READ,
   },
   {
+    name: "ballistic_profile",
+    method: "combat.ballistics",
+    title: "Projectile ballistic profiles",
+    description:
+      "Client-only. Return the versioned projectile profile table for the running Minecraft version: per profile id the projectile and launcher items, the launch speed and charge rules, gravity and air/water inertia, and the impact kind and radius. These are the constants the versioned ballistic model is built from; an id that is not listed must not be simulated with a guessed speed.",
+    inputSchema: {},
+    annotations: READ,
+  },
+  {
     name: "combat_cancel",
     method: "combat.cancel",
     title: "Cancel the ranged weapon task",

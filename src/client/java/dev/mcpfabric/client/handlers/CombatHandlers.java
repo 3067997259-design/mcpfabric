@@ -3,6 +3,7 @@ package dev.mcpfabric.client.handlers;
 import com.google.gson.JsonObject;
 import dev.mcpfabric.bridge.RpcException;
 import dev.mcpfabric.bridge.RpcRouter;
+import dev.mcpfabric.client.Ballistics;
 import dev.mcpfabric.client.BotController;
 import dev.mcpfabric.client.ClientMc;
 import net.minecraft.client.Minecraft;
@@ -40,6 +41,11 @@ public final class CombatHandlers {
 		});
 
 		router.register("combat.status", ctx -> ClientMc.call(() -> BotController.get().combatStatusJson()));
+
+		// CD-B1: versioned projectile profiles the main process discovers as the
+		// `ballistic-profiles` capability. Pure data, so no control gate and no
+		// render-thread dispatch.
+		router.register("combat.ballistics", ctx -> Ballistics.profilesJson());
 
 		router.register("combat.cancel", ctx -> {
 			requireControl();
