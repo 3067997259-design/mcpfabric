@@ -527,41 +527,36 @@ public final class BotController {
 			return;
 		}
 		if (!jumpTakeoffIssued && p.onGround()) {
-			// Only the *lateral* velocity is harmful: a drift across the flight
-			// line cannot be corrected in the air (0.098/tick of input), while
-			// the along-component is a walking run-up that lengthens the hop.
-			// Gating on total speed forced standstill takeoffs, which fall short
-			// of a step the walking hop clears (live hill run: the predictor
-			// refused a takeoff the walking bot had been making).
-			double lateral = -p.getDeltaMovement().x * jumpDirZ + p.getDeltaMovement().z * jumpDirX;
-			if (Math.abs(lateral) > JUMP_TAKEOFF_MAX_SPEED) {
-				holdPosition(p);
-				return;
-			}
+			// The takeoff gate is the prediction itself. A fixed speed gate is a
+			// false-negative source: the audited successful chain takeoff carried
+			// 0.096 of run-up (0.068 lateral to the block-centre line) and that
+			// speed was what slid it around the pillar corner, yet it exceeds the
+			// old 0.06 threshold. No candidate means "no plan found in this state
+			// and search range"; the caller replans, it never disables the edge.
 			if (passed >= -jumpTakeoffRadius) {
 				// Batch 4 decision, re-evaluated every tick (the expert's
 				// "execute one tick, predict again"): jump when the takeoff is
-				// predicted to land on the destination support, hold while the
-				// wait option is better, and fail honestly when neither can land
-				// safely instead of walking off the edge (the pillar-clipped
-				// chain hop predicts no safe takeoff).
+				// predicted to land on a support at the destination level, and
+				// hold while no candidate can. A refusal is reported as
+				// no_safe_takeoff so the caller replans; it is never a verdict
+				// that the edge is impassable.
 				// Candidate search over the takeoff position and timing. The
-				// direct jump is the first candidate; the others reposition for a
-				// few ticks first, which is what lets a hop that the adjacent
-				// pillar clips line up beside it instead of being refused.
+				// direct jump is the first candidate; the others reposition or
+				// hold for a few ticks first, which is what lets a hop that the
+				// adjacent pillar clips line up beside it.
 				JumpPredictor.Result now = JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8);
 				JumpPredictor.Result wait = JumpPredictor.simulate(p, 1, 0, false, jumpTargetX, jumpTargetZ, 24, 8);
 				JumpPredictor.Result best = now;
 				int bestPreTicks = 0;
 				double bestPreForward = 0;
 				double bestPreStrafe = 0;
-				double bestScore = takeoffScore(now);
+				double bestScore = takeoffScore(now, 0);
 				if (jumpPredictionNow == null) {
 					jumpPredictionNow = JumpPredictor.toJson(now, 26);
 					jumpPredictionFirst = jumpPredictionNow;
 					jumpPredictionWait = JumpPredictor.toJson(wait, 26);
 					jumpRealTrailBase = jumpTicks;
-					debugTakeoff(p, now, wait, takeoffScore(now), takeoffScore(wait));
+					debugTakeoff(p, now, wait, takeoffScore(now, 0), takeoffScore(wait, 0));
 				}
 				for (int[] candidate : JUMP_TAKEOFF_CANDIDATES) {
 					int preTicks = candidate[0];
@@ -569,7 +564,7 @@ public final class BotController {
 					double preStrafe = candidate[2];
 					JumpPredictor.Result result = JumpPredictor.simulate(
 							p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8, preTicks, preForward, preStrafe);
-					double score = takeoffScore(result);
+					double score = takeoffScore(result, preTicks);
 					if (!Double.isFinite(score))
 						continue;
 					if (!Double.isFinite(bestScore) || score < bestScore - 1e-6) {
@@ -591,9 +586,13 @@ public final class BotController {
 				}
 				if (bestPreTicks > 0) {
 					// Reposition this tick (the search runs again next tick, so a
-					// changed state cannot leave the bot committed).
+					// changed state cannot leave the bot committed). The wait cap
+					// applies to every reposition, not only to multi-tick ones:
+					// with the cap skipped for one-tick candidates the search
+					// walked the bot forward across the pad without ever
+					// committing to a jump (live chain run: 22 waits, fell).
 					jumpWaitTicks++;
-					if (bestPreTicks > 1 && jumpWaitTicks > JUMP_TAKEOFF_WAIT_MAX) {
+					if (jumpWaitTicks > JUMP_TAKEOFF_WAIT_MAX) {
 						finishJump("failed", "no_safe_takeoff");
 						return;
 					}
@@ -742,19 +741,28 @@ public final class BotController {
 	/**
 	 * Scores one predicted takeoff option; not finite means "do not use".
 	 *
-	 * A safe option comes to rest on a support at the destination level and as
-	 * close to the handoff target as possible. A landing below the target (the
-	 * bot would stand against the step instead of climbing it) or one that
-	 * slides off is refused, which is what makes the pillar-clipped hop fail
-	 * fast instead of dropping the bot.
+	 * A safe option touches down after the takeoff and still rests on a floor at
+	 * the destination level, as close to the handoff target as possible. A
+	 * landing below the target (the bot would stand against the step instead of
+	 * climbing it) or one that slides off its far edge scores unsafe. Everything
+	 * else — including a refusal — is a statement about this state and this
+	 * search range, not about the edge.
+	 *
+	 * <p>Repositioning carries a small cost so a plan that is already safe jumps
+	 * now. Without it the search kept preferring "one more forward tick then
+	 * jump" — each tick improved the predicted landing — and the bot walked the
+	 * whole pad instead of committing (live chain run: 22 waits, walked off).
 	 */
-	private double takeoffScore(JumpPredictor.Result prediction) {
+	private double takeoffScore(JumpPredictor.Result prediction, int preTicks) {
 		if (prediction.landTick < 0 || !prediction.staysOnSupport)
 			return Double.NaN;
 		if (Math.abs(prediction.restY - jumpTargetY) > 0.35)
 			return Double.NaN;
-		return prediction.restToTarget;
+		return prediction.restToTarget + JUMP_REPOSITION_COST * preTicks;
 	}
+
+	/** Per-tick cost of repositioning before the takeoff, in blocks. */
+	private static final double JUMP_REPOSITION_COST = 0.03;
 
 	/** Compact takeoff-decision trace for the live diagnosis. */
 	private void debugTakeoff(LocalPlayer p, JumpPredictor.Result now, JumpPredictor.Result wait, double nowScore, double waitScore) {
@@ -769,7 +777,7 @@ public final class BotController {
 
 	/** Takeoff candidates as {preTicks, preForward, preStrafe}. */
 	private static final int[][] JUMP_TAKEOFF_CANDIDATES = {
-			{ 1, 1, 0 }, { 2, 1, 0 },
+			{ 1, 0, 0 }, { 1, 1, 0 }, { 2, 1, 0 },
 			{ 1, 1, 1 }, { 1, 1, -1 }, { 2, 1, 1 }, { 2, 1, -1 },
 			{ 1, -1, 0 },
 	};

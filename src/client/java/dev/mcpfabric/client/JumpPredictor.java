@@ -50,9 +50,15 @@ public final class JumpPredictor {
 		public double landX, landY, landZ;
 		/** Where the bot coasts to rest after the touchdown. */
 		public double restX, restY, restZ;
-		/** True when the rest position still stands on the same support block. */
+		/**
+		 * True when the rest tick still touches a floor, so the option does not
+		 * slide off the far edge of its landing. This comes from the simulated
+		 * contact itself, not from a block lookup under the centre: the audit's
+		 * successful chain landing had its centre 0.08 outside the target block
+		 * while the feet box already covered the support.
+		 */
 		public boolean staysOnSupport;
-		/** Block id under the rest position, or empty when unknown. */
+		/** Block id under the rest footprint, or empty when unknown. */
 		public String restSupport = "";
 		/** Horizontal distance from the rest position to the handoff target. */
 		public double restToTarget = Double.NaN;
@@ -107,73 +113,74 @@ public final class JumpPredictor {
 		Vec3 motion = p.getDeltaMovement();
 		AABB box = p.getBoundingBox();
 		boolean onGround = p.onGround();
-
-		float yaw = p.getYRot();
-		double sin = Math.sin(Math.toRadians(yaw));
-		double cos = Math.cos(Math.toRadians(yaw));
-		// Minecraft yaw frame: forward = (-sin, cos), strafe-right = (-cos, -sin).
-		double inputX = inputForward * -sin + inputStrafe * -cos;
-		double inputZ = inputForward * cos + inputStrafe * -sin;
-		double preInputX = preForward * -sin + preStrafe * -cos;
-		double preInputZ = preForward * cos + preStrafe * -sin;
-		double length = Math.hypot(inputX, inputZ);
-		if (length > 1e-6) {
-			inputX /= length;
-			inputZ /= length;
-		}
-		double preLength = Math.hypot(preInputX, preInputZ);
-		if (preLength > 1e-6) {
-			preInputX /= preLength;
-			preInputZ /= preLength;
-		}
+		boolean jumpIssued = false;
 
 		for (int tick = 1; tick <= maxTicks + settleTicks; tick++) {
 			boolean settling = result.landTick >= 0;
 			boolean pre = tick <= preTicks;
+			// The executor re-aims on the target every tick, so the simulated
+			// input direction is recomputed from the simulated position: the
+			// successful chain hop turned from -47.8 to -4.5 degrees while it
+			// slid around the pillar corner, and a single fixed heading cannot
+			// represent that control.
+			double aimX = targetX - position.x;
+			double aimZ = targetZ - position.z;
+			if (aimX * aimX + aimZ * aimZ < 1e-8) {
+				aimX = 0;
+				aimZ = 1;
+			}
+			double yawRad = Math.atan2(-aimX, aimZ);
+			double sin = Math.sin(yawRad);
+			double cos = Math.cos(yawRad);
+			double forward = settling ? 0 : pre ? preForward : inputForward;
+			double strafe = settling ? 0 : pre ? preStrafe : inputStrafe;
+			// Minecraft yaw frame: forward = (-sin, cos), strafe-right = (-cos, -sin).
+			double directionX = forward * -sin + strafe * -cos;
+			double directionZ = forward * cos + strafe * -sin;
+			double length = Math.hypot(directionX, directionZ);
+			if (length > 1e-6) {
+				directionX /= length;
+				directionZ /= length;
+			}
+
+			boolean jumping = jump && !pre && !jumpIssued && onGround && result.landTick < 0;
+			if (jumping) {
+				motion = new Vec3(motion.x, JUMP_VELOCITY, motion.z);
+				jumpIssued = true;
+			}
+			// Vanilla order (audited against the 1.21.1 bytecode): the takeoff
+			// tick itself still moves with the ground coefficients because
+			// jumpFromGround sets the vertical speed without clearing the
+			// grounded state; only later ticks use the air coefficients. Using
+			// the air branch here dropped the first-tick step from 0.098 to
+			// 0.0196 and made the whole hop land 0.288 short.
 			boolean air = !onGround;
 			double acceleration = air ? AIR_ACCELERATION : GROUND_ACCELERATION;
 			double retention = air ? AIR_RETENTION : GROUND_RETENTION;
-			double forward = settling ? 0 : pre ? preForward : inputForward;
-			double strafe = settling ? 0 : pre ? preStrafe : inputStrafe;
-
-			if (jump && !pre && tick == preTicks + 1 && onGround && result.landTick < 0) {
-				motion = new Vec3(motion.x, JUMP_VELOCITY, motion.z);
-				onGround = false;
-				air = true;
-				acceleration = AIR_ACCELERATION;
-				retention = AIR_RETENTION;
-			}
-
-			// The input vector used this tick follows the pre-takeoff phase too,
-			// so a repositioning candidate is simulated with its own heading.
-			double directionX = pre ? preInputX : inputX;
-			double directionZ = pre ? preInputZ : inputZ;
 			double mx = settling ? motion.x : motion.x + acceleration * directionX;
 			double mz = settling ? motion.z : motion.z + acceleration * directionZ;
-			// Vanilla order: this tick moves with the current vertical velocity;
-			// gravity and drag shape the *next* tick. Applying them here made the
-			// first jump tick rise 0.333 instead of 0.42 and the predicted arc
-			// lag the real one (live alignment run).
+			// This tick moves with the current vertical velocity; gravity and
+			// drag shape the *next* tick (live alignment run).
 			double my = motion.y;
 			Vec3 requested = new Vec3(mx, my, mz);
 			// The entity-aware helper clips a movement against the world's block
-			// shapes for the given box; the real player is never moved.
+			// shapes for the given box; the real player is never moved. It does
+			// not model the 0.6 auto-step, so walked takeoffs onto a low step can
+			// be predicted short: conservative, never optimistic.
 			Vec3 clipped = Entity.collideBoundingBox(p, requested, box, level, List.of());
 			position = position.add(clipped);
 			box = box.move(clipped);
-			boolean landedThisTick = false;
-			if (my < 0 && clipped.y != my) {
-				// The vertical move was clipped: a floor this tick.
-				onGround = true;
-				landedThisTick = result.landTick < 0;
-				motion = new Vec3(clipped.x, 0, clipped.z);
-			}
-			else {
-				onGround = false;
-				// Next tick's vertical velocity: gravity, then drag.
-				double nextVy = (clipped.y - GRAVITY) * VERTICAL_DRAG;
-				motion = new Vec3(clipped.x * retention, nextVy, clipped.z * retention);
-			}
+			// A clipped downward move is floor contact. It only counts as a
+			// landing while airborne: on the ground the standing player's own
+			// -0.0784 vertical speed is clipped every tick, and treating that as
+			// a touchdown made every pre-move candidate think it had landed and
+			// then refuse to issue its jump.
+			boolean floorContact = my < 0 && clipped.y != my;
+			onGround = floorContact;
+			motion = new Vec3(
+					clipped.x * retention,
+					(clipped.y - GRAVITY) * VERTICAL_DRAG,
+					clipped.z * retention);
 
 			Tick state = new Tick();
 			state.x = position.x;
@@ -185,7 +192,7 @@ public final class JumpPredictor {
 			state.onGround = onGround;
 			result.trail.add(state);
 
-			if (landedThisTick) {
+			if (floorContact && air && jumpIssued && result.landTick < 0) {
 				result.landTick = tick;
 				result.landX = position.x;
 				result.landY = position.y;
@@ -207,20 +214,43 @@ public final class JumpPredictor {
 		}
 
 		if (result.landTick >= 0) {
-			net.minecraft.core.BlockPos support = net.minecraft.core.BlockPos.containing(result.landX, result.landY - 0.1, result.landZ);
-			net.minecraft.world.level.block.state.BlockState below = level.getBlockState(support);
-			result.restSupport = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(below.getBlock()).toString();
-			// The rest position must stand on something at the same level: a
-			// flight that touches the step and then slides off the far edge is
-			// not a safe option. Comparing the exact block would flag a flat
-			// walk that simply coasts onto the next pad cell.
-			net.minecraft.core.BlockPos restSupport = net.minecraft.core.BlockPos.containing(result.restX, result.restY - 0.1, result.restZ);
-			net.minecraft.world.level.block.state.BlockState restBelow = level.getBlockState(restSupport);
-			result.staysOnSupport = !restBelow.isAir()
-					&& Math.abs(result.restY - restSupport.getY() - 1) <= 0.6;
+			Tick last = result.trail.get(result.trail.size() - 1);
+			// The rest is supported when the last simulated tick still touched a
+			// floor; a flight that touches the step and then slides off its far
+			// edge ends airborne and is refused by the caller.
+			result.staysOnSupport = last.onGround;
+			result.restSupport = supportName(level, result.restX, result.restY, result.restZ);
 			result.restToTarget = Math.hypot(result.restX - targetX, result.restZ - targetZ);
 		}
 		return result;
+	}
+
+	/**
+	 * Names the first non-passable block under the feet box.
+	 *
+	 * @example
+	 * supportName(level, 91.542, 81.0, -12.203)
+	 * // => 'minecraft:dirt' (the target step, not the block under the centre)
+	 */
+	private static String supportName(Level level, double x, double y, double z) {
+		double half = 0.3;
+		int minX = net.minecraft.util.Mth.floor(x - half);
+		int maxX = net.minecraft.util.Mth.floor(x + half);
+		int minZ = net.minecraft.util.Mth.floor(z - half);
+		int maxZ = net.minecraft.util.Mth.floor(z + half);
+		int below = net.minecraft.util.Mth.floor(y - 0.1);
+		for (int bx = minX; bx <= maxX; bx++) {
+			for (int bz = minZ; bz <= maxZ; bz++) {
+				net.minecraft.core.BlockPos pos = new net.minecraft.core.BlockPos(bx, below, bz);
+				net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+				if (state.isAir())
+					continue;
+				if (state.getCollisionShape(level, pos).isEmpty())
+					continue;
+				return net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+			}
+		}
+		return "";
 	}
 
 	/** Compact JSON summary of one prediction for the status trace. */
@@ -248,6 +278,7 @@ public final class JumpPredictor {
 			entry.addProperty("z", tick.z);
 			entry.addProperty("vx", tick.vx);
 			entry.addProperty("vz", tick.vz);
+			entry.addProperty("onGround", tick.onGround);
 			trail.add(entry);
 		}
 		object.add("trail", trail);
