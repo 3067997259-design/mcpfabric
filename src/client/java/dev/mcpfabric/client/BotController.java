@@ -545,18 +545,42 @@ public final class BotController {
 				// wait option is better, and fail honestly when neither can land
 				// safely instead of walking off the edge (the pillar-clipped
 				// chain hop predicts no safe takeoff).
+				// Candidate search over the takeoff position and timing. The
+				// direct jump is the first candidate; the others reposition for a
+				// few ticks first, which is what lets a hop that the adjacent
+				// pillar clips line up beside it instead of being refused.
 				JumpPredictor.Result now = JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8);
 				JumpPredictor.Result wait = JumpPredictor.simulate(p, 1, 0, false, jumpTargetX, jumpTargetZ, 24, 8);
-				double nowScore = takeoffScore(now);
-				double waitScore = takeoffScore(wait);
+				JumpPredictor.Result best = now;
+				int bestPreTicks = 0;
+				double bestPreForward = 0;
+				double bestPreStrafe = 0;
+				double bestScore = takeoffScore(now);
 				if (jumpPredictionNow == null) {
 					jumpPredictionNow = JumpPredictor.toJson(now, 26);
 					jumpPredictionFirst = jumpPredictionNow;
 					jumpPredictionWait = JumpPredictor.toJson(wait, 26);
 					jumpRealTrailBase = jumpTicks;
-					debugTakeoff(p, now, wait, nowScore, waitScore);
+					debugTakeoff(p, now, wait, takeoffScore(now), takeoffScore(wait));
 				}
-				if (!Double.isFinite(nowScore) && !Double.isFinite(waitScore)) {
+				for (int[] candidate : JUMP_TAKEOFF_CANDIDATES) {
+					int preTicks = candidate[0];
+					double preForward = candidate[1];
+					double preStrafe = candidate[2];
+					JumpPredictor.Result result = JumpPredictor.simulate(
+							p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8, preTicks, preForward, preStrafe);
+					double score = takeoffScore(result);
+					if (!Double.isFinite(score))
+						continue;
+					if (!Double.isFinite(bestScore) || score < bestScore - 1e-6) {
+						bestScore = score;
+						best = result;
+						bestPreTicks = preTicks;
+						bestPreForward = preForward;
+						bestPreStrafe = preStrafe;
+					}
+				}
+				if (!Double.isFinite(bestScore)) {
 					jumpWaitTicks++;
 					if (jumpWaitTicks > JUMP_TAKEOFF_WAIT_MAX) {
 						finishJump("failed", "no_safe_takeoff");
@@ -565,14 +589,21 @@ public final class BotController {
 					holdPosition(p);
 					return;
 				}
-				if (Double.isFinite(waitScore) && (!Double.isFinite(nowScore) || waitScore < nowScore)) {
+				if (bestPreTicks > 0) {
+					// Reposition this tick (the search runs again next tick, so a
+					// changed state cannot leave the bot committed).
 					jumpWaitTicks++;
-					holdPosition(p);
+					if (bestPreTicks > 1 && jumpWaitTicks > JUMP_TAKEOFF_WAIT_MAX) {
+						finishJump("failed", "no_safe_takeoff");
+						return;
+					}
+					jumpPredictionNow = JumpPredictor.toJson(best, 26);
+					applyRepositionInput(p, bestPreForward, bestPreStrafe);
 					return;
 				}
 				// The executed takeoff's own prediction replaces the first
 				// snapshot, so the evidence matches the flight that happened.
-				jumpPredictionNow = JumpPredictor.toJson(now, 26);
+				jumpPredictionNow = JumpPredictor.toJson(best, 26);
 				jumpTakeoffIssued = true;
 				jumpPhase = "takeoff";
 				pressHorizontal(true);
@@ -735,6 +766,27 @@ public final class BotController {
 	}
 
 	private volatile String jumpTakeoffTrace = "";
+
+	/** Takeoff candidates as {preTicks, preForward, preStrafe}. */
+	private static final int[][] JUMP_TAKEOFF_CANDIDATES = {
+			{ 1, 1, 0 }, { 2, 1, 0 },
+			{ 1, 1, 1 }, { 1, 1, -1 }, { 2, 1, 1 }, { 2, 1, -1 },
+			{ 1, -1, 0 },
+	};
+
+	/** Applies one candidate's repositioning input, view on the target. */
+	private void applyRepositionInput(LocalPlayer p, double forward, double strafe) {
+		int forwardSign = forward > 0 ? 1 : forward < 0 ? -1 : 0;
+		int strafeSign = strafe > 0 ? 1 : strafe < 0 ? -1 : 0;
+		aimAtPoint(p, jumpTargetX, jumpTargetY, jumpTargetZ);
+		fwd = forwardSign > 0;
+		back = forwardSign < 0;
+		left = strafeSign < 0;
+		right = strafeSign > 0;
+		sprint = false;
+		jumpHeld = false;
+		jumpInput = inputName(forwardSign, strafeSign);
+	}
 
 	/**
 	 * Stops the bot without walking toward an unprotected edge.

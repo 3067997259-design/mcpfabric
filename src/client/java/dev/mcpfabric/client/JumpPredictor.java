@@ -77,6 +77,30 @@ public final class JumpPredictor {
 			double targetZ,
 			int maxTicks,
 			int settleTicks) {
+		return simulate(p, inputForward, inputStrafe, jump, targetX, targetZ, maxTicks, settleTicks, 0, 0, 0);
+	}
+
+	/**
+	 * Simulates one takeoff candidate.
+	 *
+	 * @param preTicks ticks of repositioning input applied before the jump, so a
+	 * candidate can shift the takeoff position or heading (for example a strafe
+	 * that lines the flight up beside a pillar the direct diagonal clips)
+	 * @param preForward forward input during those ticks
+	 * @param preStrafe strafe-right input during those ticks
+	 */
+	public static Result simulate(
+			LocalPlayer p,
+			double inputForward,
+			double inputStrafe,
+			boolean jump,
+			double targetX,
+			double targetZ,
+			int maxTicks,
+			int settleTicks,
+			int preTicks,
+			double preForward,
+			double preStrafe) {
 		Result result = new Result();
 		Level level = p.level();
 		Vec3 position = p.position();
@@ -90,21 +114,29 @@ public final class JumpPredictor {
 		// Minecraft yaw frame: forward = (-sin, cos), strafe-right = (-cos, -sin).
 		double inputX = inputForward * -sin + inputStrafe * -cos;
 		double inputZ = inputForward * cos + inputStrafe * -sin;
+		double preInputX = preForward * -sin + preStrafe * -cos;
+		double preInputZ = preForward * cos + preStrafe * -sin;
 		double length = Math.hypot(inputX, inputZ);
 		if (length > 1e-6) {
 			inputX /= length;
 			inputZ /= length;
 		}
+		double preLength = Math.hypot(preInputX, preInputZ);
+		if (preLength > 1e-6) {
+			preInputX /= preLength;
+			preInputZ /= preLength;
+		}
 
 		for (int tick = 1; tick <= maxTicks + settleTicks; tick++) {
-			boolean settling = result.landTick >= 0 && tick > result.landTick + 0;
+			boolean settling = result.landTick >= 0;
+			boolean pre = tick <= preTicks;
 			boolean air = !onGround;
 			double acceleration = air ? AIR_ACCELERATION : GROUND_ACCELERATION;
 			double retention = air ? AIR_RETENTION : GROUND_RETENTION;
-			double forward = settling ? 0 : inputForward;
-			double strafe = settling ? 0 : inputStrafe;
+			double forward = settling ? 0 : pre ? preForward : inputForward;
+			double strafe = settling ? 0 : pre ? preStrafe : inputStrafe;
 
-			if (jump && onGround && result.landTick < 0) {
+			if (jump && !pre && tick == preTicks + 1 && onGround && result.landTick < 0) {
 				motion = new Vec3(motion.x, JUMP_VELOCITY, motion.z);
 				onGround = false;
 				air = true;
@@ -112,12 +144,12 @@ public final class JumpPredictor {
 				retention = AIR_RETENTION;
 			}
 
-			double mx = motion.x + acceleration * (forward == 0 ? 0 : inputX);
-			double mz = motion.z + acceleration * (strafe == 0 ? 0 : inputZ);
-			if (settling) {
-				mx = motion.x;
-				mz = motion.z;
-			}
+			// The input vector used this tick follows the pre-takeoff phase too,
+			// so a repositioning candidate is simulated with its own heading.
+			double directionX = pre ? preInputX : inputX;
+			double directionZ = pre ? preInputZ : inputZ;
+			double mx = settling ? motion.x : motion.x + acceleration * directionX;
+			double mz = settling ? motion.z : motion.z + acceleration * directionZ;
 			// Vanilla order: this tick moves with the current vertical velocity;
 			// gravity and drag shape the *next* tick. Applying them here made the
 			// first jump tick rise 0.333 instead of 0.42 and the predicted arc
