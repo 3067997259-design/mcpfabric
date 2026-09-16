@@ -166,6 +166,18 @@ public final class BotController {
 	private boolean jumpBrake;
 	private long jumpDeadline;
 	private int jumpTicks;
+	/**
+	 * Ticks one task may run before it reports deadline.
+	 *
+	 * The cap scales with the submitted chain: the combo fixture submits a long
+	 * chain, and a fixed 200 ticks (ten seconds) expired while the task was still
+	 * settling on an iron-bar top (ailed / deadline, two edges done). The
+	 * payload deadline from the host is the real bound; this is the safety net.
+	 */
+	private int jumpTickCap = 200;
+	/** Takeoff re-arms allowed for one edge after a short landing. */
+	private static final int JUMP_EDGE_RETRY_MAX = 3;
+	private int jumpRetryCount;
 	/** Ground friction speed retention, used by the settling stop estimate. */
 	private static final double GROUND_SPEED_RETENTION = 0.546;
 	/**
@@ -300,6 +312,8 @@ public final class BotController {
 		jumpIntent = landingIntent == null || landingIntent.isEmpty() ? "stop" : landingIntent;
 		jumpDeadline = deadlineMillis;
 		jumpTicks = 0;
+		jumpTickCap = Math.max(200, edges.size() * 200);
+		jumpRetryCount = 0;
 		jumpPredictedStop = 0;
 		jumpCompletedEdges.clear();
 		jumpCompletedCount = 0;
@@ -325,6 +339,7 @@ public final class BotController {
 
 	/** Copies one edge into the active fields and resets the per-edge machine. */
 	private void applyEdge(JumpEdge edge) {
+		jumpRetryCount = 0;
 		jumpEdgeId = edge.edgeId == null ? "" : edge.edgeId;
 		jumpFromX = edge.fromX;
 		jumpFromY = edge.fromY;
@@ -504,7 +519,25 @@ public final class BotController {
 			finishJump("failed", "fell");
 			return;
 		}
-		if (jumpTicks > 200) {
+		if (p.onGround() && jumpTouchedDown && Math.abs(p.getY() - jumpTargetY) > 0.35) {
+			// Touched down off the target level: the hop fell short (live combo
+			// run: she landed at the iron-bar base, and the task pressed forward
+			// into the post until its deadline, 800 ticks of nothing). Re-arm the
+			// same edge for a bounded number of attempts, then fail so the host
+			// replans instead of hanging.
+			jumpRetryCount++;
+			if (jumpRetryCount > JUMP_EDGE_RETRY_MAX) {
+				finishJump("failed", "short_landing");
+				return;
+			}
+			jumpTakeoffIssued = false;
+			jumpAirborneSeen = false;
+			jumpTouchedDown = false;
+			jumpWaitTicks = 0;
+			jumpPhase = "prepare";
+			return;
+		}
+		if (jumpTicks > jumpTickCap) {
 			finishJump("failed", "deadline");
 			return;
 		}
@@ -666,7 +699,13 @@ public final class BotController {
 		// The settle is bounded: a controller that cannot centre the bot must not
 		// report failure for a landing that is already on the pad, so the cap
 		// accepts the measured position when it is inside the host's tolerance.
-		if (jumpSettleTicks >= cap && Math.hypot(jumpAlongError, jumpLateralError) <= 0.5) {
+		// A grounded, slow bot on any support also counts: on a thin iron-bar
+		// top the centring corrections can stall, and the live combo task sat in
+		// this phase until its deadline with two edges done. The next edge's
+		// takeoff prediction validates the spot anyway.
+		if (jumpSettleTicks >= cap
+				&& (Math.hypot(jumpAlongError, jumpLateralError) <= 0.5
+					|| (p.onGround() && speed <= 0.05))) {
 			stopAllMovement();
 			if (advanceOnParked)
 				return false;
