@@ -544,8 +544,8 @@ public final class BotController {
 				// direct jump is the first candidate; the others reposition or
 				// hold for a few ticks first, which is what lets a hop that the
 				// adjacent pillar clips line up beside it.
-				JumpPredictor.Result now = JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8);
-				JumpPredictor.Result wait = JumpPredictor.simulate(p, 1, 0, false, jumpTargetX, jumpTargetZ, 24, 8);
+				JumpPredictor.Result now = JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8, 0, 0, 0, jumpSprint);
+				JumpPredictor.Result wait = JumpPredictor.simulate(p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8, 1, 0, 0, jumpSprint);
 				JumpPredictor.Result best = now;
 				int bestPreTicks = 0;
 				double bestPreForward = 0;
@@ -563,7 +563,7 @@ public final class BotController {
 					double preForward = candidate[1];
 					double preStrafe = candidate[2];
 					JumpPredictor.Result result = JumpPredictor.simulate(
-							p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8, preTicks, preForward, preStrafe);
+							p, 1, 0, true, jumpTargetX, jumpTargetZ, 24, 8, preTicks, preForward, preStrafe, jumpSprint);
 					double score = takeoffScore(result, preTicks);
 					if (!Double.isFinite(score))
 						continue;

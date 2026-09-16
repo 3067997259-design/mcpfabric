@@ -34,6 +34,15 @@ public final class JumpPredictor {
 	public static final double AIR_ACCELERATION = 0.0196;
 	public static final double GROUND_RETENTION = 0.546;
 	public static final double AIR_RETENTION = 0.91;
+	/** Sprinting raises the ground input acceleration and the takeoff impulse. */
+	public static final double SPRINT_ACCELERATION = 0.1274;
+	/**
+	 * Horizontal boost a sprinting jump adds along the facing.
+	 *
+	 * This is the term that makes a level three-cell gap possible: without it
+	 * the sprint reach at a level landing stops near 2.2 blocks.
+	 */
+	public static final double SPRINT_JUMP_BOOST = 0.2;
 
 	/** One simulated tick. */
 	public static final class Tick {
@@ -83,18 +92,9 @@ public final class JumpPredictor {
 			double targetZ,
 			int maxTicks,
 			int settleTicks) {
-		return simulate(p, inputForward, inputStrafe, jump, targetX, targetZ, maxTicks, settleTicks, 0, 0, 0);
+		return simulate(p, inputForward, inputStrafe, jump, targetX, targetZ, maxTicks, settleTicks, 0, 0, 0, false);
 	}
 
-	/**
-	 * Simulates one takeoff candidate.
-	 *
-	 * @param preTicks ticks of repositioning input applied before the jump, so a
-	 * candidate can shift the takeoff position or heading (for example a strafe
-	 * that lines the flight up beside a pillar the direct diagonal clips)
-	 * @param preForward forward input during those ticks
-	 * @param preStrafe strafe-right input during those ticks
-	 */
 	public static Result simulate(
 			LocalPlayer p,
 			double inputForward,
@@ -107,6 +107,34 @@ public final class JumpPredictor {
 			int preTicks,
 			double preForward,
 			double preStrafe) {
+		return simulate(p, inputForward, inputStrafe, jump, targetX, targetZ, maxTicks, settleTicks, preTicks, preForward, preStrafe, false);
+	}
+
+	/**
+	 * Simulates one takeoff candidate.
+	 *
+	 * @param preTicks ticks of repositioning input applied before the jump, so a
+	 * candidate can shift the takeoff position or heading (for example a strafe
+	 * that lines the flight up beside a pillar the direct diagonal clips)
+	 * @param preForward forward input during those ticks
+	 * @param preStrafe strafe-right input during those ticks
+	 * @param sprint true when the edge is taken with the sprint key held. The
+	 * ground acceleration and the takeoff boost then change, and a level gap
+	 * edge depends on both.
+	 */
+	public static Result simulate(
+			LocalPlayer p,
+			double inputForward,
+			double inputStrafe,
+			boolean jump,
+			double targetX,
+			double targetZ,
+			int maxTicks,
+			int settleTicks,
+			int preTicks,
+			double preForward,
+			double preStrafe,
+			boolean sprint) {
 		Result result = new Result();
 		Level level = p.level();
 		Vec3 position = p.position();
@@ -146,6 +174,12 @@ public final class JumpPredictor {
 			boolean jumping = jump && !pre && !jumpIssued && onGround && result.landTick < 0;
 			if (jumping) {
 				motion = new Vec3(motion.x, JUMP_VELOCITY, motion.z);
+				if (sprint) {
+					// jumpFromGround adds 0.2 along the facing. The executor aims
+					// at the target every tick, so the facing equals this tick's
+					// input direction.
+					motion = motion.add(directionX * SPRINT_JUMP_BOOST, 0, directionZ * SPRINT_JUMP_BOOST);
+				}
 				jumpIssued = true;
 			}
 			// Vanilla order (audited against the 1.21.1 bytecode): the takeoff
@@ -155,7 +189,7 @@ public final class JumpPredictor {
 			// the air branch here dropped the first-tick step from 0.098 to
 			// 0.0196 and made the whole hop land 0.288 short.
 			boolean air = !onGround;
-			double acceleration = air ? AIR_ACCELERATION : GROUND_ACCELERATION;
+			double acceleration = air ? AIR_ACCELERATION : sprint ? SPRINT_ACCELERATION : GROUND_ACCELERATION;
 			double retention = air ? AIR_RETENTION : GROUND_RETENTION;
 			double mx = settling ? motion.x : motion.x + acceleration * directionX;
 			double mz = settling ? motion.z : motion.z + acceleration * directionZ;
