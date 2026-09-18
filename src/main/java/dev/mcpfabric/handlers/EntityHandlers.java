@@ -14,6 +14,7 @@ import dev.mcpfabric.handlers.support.Levels;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
@@ -159,6 +160,17 @@ public final class EntityHandlers {
 		// it, never that the entity is not gliding.
 		if (e instanceof LivingEntity le) {
 			o.addProperty("fallFlying", le.isFallFlying());
+			// B-08: active status effects so a spectral or tipped arrow hit can be
+			// read back from the same detail record the aim used.
+			JsonArray effects = new JsonArray();
+			for (MobEffectInstance effect : le.getActiveEffects()) {
+				JsonObject item = new JsonObject();
+				item.addProperty("id", effect.getEffect().unwrapKey().map(key -> key.location().toString()).orElse("unknown"));
+				item.addProperty("amplifier", effect.getAmplifier());
+				item.addProperty("duration", effect.getDuration());
+				effects.add(item);
+			}
+			o.add("effects", effects);
 		}
 		Entity vehicle = e.getVehicle();
 		o.addProperty("riding", vehicle != null);

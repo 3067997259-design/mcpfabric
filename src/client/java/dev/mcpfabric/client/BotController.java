@@ -11,14 +11,22 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.projectile.AbstractArrow;
+import net.minecraft.world.entity.projectile.FireworkRocketEntity;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.entity.projectile.ThrownTrident;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ChargedProjectiles;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 //? if <26.1 {
 import net.minecraft.world.inventory.ClickType;
@@ -85,13 +93,88 @@ public final class BotController {
 	private static final List<String> ARROW_ITEMS = List.of(
 			"minecraft:arrow", "minecraft:tipped_arrow", "minecraft:spectral_arrow");
 
-	/** Approximate projectile speed in blocks/tick, used to estimate flight time. */
-	private static final double COMBAT_PROJECTILE_SPEED = 3.0;
-	/** Flight-time clamp: at least one tick, at most two seconds. */
+	/**
+	 * Flight-time clamp: at least one tick, at most two seconds. Kept for the lead pass, which
+	 * clamps the ballistic solver's predicted flight time to the same window.
+	 */
 	private static final double COMBAT_MIN_FLIGHT_TICKS = 1.0;
 	private static final double COMBAT_MAX_FLIGHT_TICKS = 40.0;
 	/** Lead distance cap in blocks, so an extreme velocity cannot over-aim. */
 	private static final double COMBAT_MAX_LEAD_BLOCKS = 6.0;
+	/** Own or vehicle motion below this counts as at rest when picking a lead. */
+	private static final double COMBAT_MIN_MOTION_SQR = 1.0E-4;
+	/** Ticks the crossbow load use is held before the deliberate release (vanilla load 25). */
+	private static final int CROSSBOW_LOAD_HOLD_TICKS = 30;
+	/** Ticks per hold+release cycle while waiting for the charged component. */
+	private static final int CROSSBOW_LOAD_CYCLE_TICKS = 45;
+	/** Bounded window before an uncharged crossbow is reported as load_timeout. */
+	private static final int CROSSBOW_LOAD_TIMEOUT_TICKS = 135;
+	/**
+	 * Ticks the client-side tracked position trails the server.
+	 *
+	 * Tracked entities are interpolated over a fixed window (vanilla lerps a
+	 * remote entity to its new position over three ticks), so a rider's client
+	 * position is about this far behind the server. An aim built from the client
+	 * position must add this before the flight time (F-26), otherwise the arrow
+	 * lands that many ticks of travel behind a moving target.
+	 */
+	private static final double COMBAT_CLIENT_INTERP_TICKS = 3.0;
+
+	/**
+	 * Ballistic launch model mirrored from the audited host profile.
+	 *
+	 * The host owns the versioned profile (`ballistics/profile.ts`, `PROFILE_VERSION 1.21.1`,
+	 * `SOLUTION_REVISION 1`), but the client aims every tick, so it runs the same per-tick model
+	 * locally instead of receiving one stale solution. Constants: arrow gravity 0.05 and air
+	 * inertia 0.99 (`AbstractArrow#tick`), spawn at `eyeY - 0.1` (`AbstractArrow` constructor),
+	 * bow speed `power(charge) * 3.0` (`BowItem#releaseUsing/#getPowerForTime`), crossbow
+	 * 3.15/1.6 and trident 2.5 (`CrossbowItem#getShootingPower`, `TridentItem#releaseUsing`).
+	 * Without this solve the aim points straight at the target and every shot lands about one
+	 * block low at 20 blocks (range measurement, 2026-09-17).
+	 */
+	private static final double BALLISTIC_GRAVITY = 0.05;
+	private static final double BALLISTIC_AIR_INERTIA = 0.99;
+	private static final double BALLISTIC_SPAWN_OFFSET_Y = -0.1;
+	private static final double BALLISTIC_BOW_MAX_SPEED = 3.0;
+	private static final int BALLISTIC_BOW_FULL_CHARGE_TICKS = 20;
+	private static final double BALLISTIC_CROSSBOW_ARROW_SPEED = 3.15;
+	private static final double BALLISTIC_CROSSBOW_FIREWORK_SPEED = 1.6;
+	private static final double BALLISTIC_TRIDENT_SPEED = 2.5;
+	/** A tick segment that passes this close to the aim point counts as a hit. */
+	private static final double BALLISTIC_HIT_RADIUS = 0.3;
+	/** The search lets a curve overshoot the target's distance by this many blocks before it stops. */
+	private static final double BALLISTIC_PAST_TARGET_MARGIN = 2.0;
+	private static final int BALLISTIC_MAX_TICKS = 120;
+	private static final double BALLISTIC_PITCH_MIN_DEG = -80.0;
+	private static final double BALLISTIC_PITCH_MAX_DEG = 80.0;
+	private static final int BALLISTIC_COARSE_STEPS = 32;
+	/** Refinement offsets in degrees around the best coarse pitch, then around its best fine pitch. */
+	private static final double[] BALLISTIC_REFINE_OFFSETS = { -2, -1.5, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 1.5, 2 };
+	private static final double[] BALLISTIC_FINE_OFFSETS = { -0.5, -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4, 0.5 };
+
+	/** One solved launch: the pitch to hold, the predicted flight time and whether a curve hit. */
+	private record BallisticAim(double pitch, int flightTicks, boolean hit) {}
+
+	/** One simulated pitch candidate and its closest approach to the aim point. */
+	private record BallisticShot(double pitch, double closest, int tick, double peakY, boolean blocked) {
+		boolean hit() {
+			return !blocked && closest <= BALLISTIC_HIT_RADIUS;
+		}
+
+		/**
+		 * Candidate ranking: a clear hit wins, then the earliest hit, then the flattest arc;
+		 * a clear miss ranks by its closest approach, and a blocked curve ranks below every
+		 * clear one. A target no curve can reach still keeps the blocked curve that passed
+		 * nearest, which is the least bad shot.
+		 */
+		double score() {
+			if (hit())
+				return tick * 1000.0 + peakY;
+			if (blocked)
+				return 1.0e12 + closest * 10000.0 + tick * 10.0;
+			return 1.0e9 + closest * 10000.0 + tick * 10.0;
+		}
+	}
 
 	private CombatPhase combatPhase = CombatPhase.IDLE;
 	private String combatWeapon;
@@ -105,6 +188,8 @@ public final class BotController {
 	private int combatHoldTicks;
 	private boolean combatCharged;
 	private int combatLoadTicks;
+	/** F-28: one release per hold+release load cycle is enough. */
+	private boolean combatLoadReleased;
 	/** Monotonic per-task shot sequence, so a receipt can name each fired projectile. */
 	private int combatNextShot;
 	private final List<UUID> combatProjectiles = new ArrayList<>();
@@ -130,6 +215,31 @@ public final class BotController {
 	private String combatAimSource = "pinned";
 	/** Bounded linear lead; disabled by config so the aim can be read straight. */
 	private boolean combatLeadEnabled = true;
+	/** Last aim-tick sample, used to estimate motion when the entity carries none (riders). */
+	private UUID combatMotionUuid;
+	private long combatMotionTick = Long.MIN_VALUE;
+	private double combatMotionX, combatMotionY, combatMotionZ;
+	/** Last lead source and its raw inputs, reported in the combat status (F-24). */
+	private String combatLeadSource = "none";
+	private Vec3 combatLeadVelocity;
+	private double combatLeadOwnSpeed = -1.0;
+	private boolean combatLeadVehicleFound;
+	private double combatLeadVehicleSpeed = -1.0;
+	private double combatLeadMeasuredSpeed = -1.0;
+	/** Final flight ticks the aim solve used, and the exact release state (F-26). */
+	private double combatLastFlightTicks = -1.0;
+	private boolean combatReleaseCaptured;
+	private double combatReleaseAimX, combatReleaseAimY, combatReleaseAimZ;
+	private double combatReleaseTargetX, combatReleaseTargetY, combatReleaseTargetZ;
+	private double combatReleaseLeadX, combatReleaseLeadY, combatReleaseLeadZ;
+	private String combatReleaseLeadSource = "none";
+	private double combatReleaseChargeTicks = -1.0;
+	private int combatReleaseHoldTicks = -1;
+	private double combatReleaseFlightTicks = -1.0;
+	private double combatReleaseArrowX = Double.NaN;
+	private double combatReleaseArrowY = Double.NaN;
+	private double combatReleaseArrowZ = Double.NaN;
+	private int combatReleaseArrowTick = -1;
 	/** A release waiting for its projectile or ammo-delta confirmation. */
 	private boolean combatShotPending;
 	private int combatShotPendingTicks;
@@ -1049,7 +1159,7 @@ public final class BotController {
 		combatPreExistingProjectiles.clear();
 		if (mc.level != null) {
 			for (Entity entity : mc.level.entitiesForRendering()) {
-				if (entity instanceof AbstractArrow || entity instanceof ThrownTrident)
+				if (entity instanceof AbstractArrow || entity instanceof ThrownTrident || entity instanceof FireworkRocketEntity)
 					combatPreExistingProjectiles.add(entity.getUUID());
 			}
 		}
@@ -1066,13 +1176,16 @@ public final class BotController {
 			combatEndReason = "weapon_unavailable";
 			return combatStatusJson();
 		}
-		if (!weapon.equals("trident") && findArrowSlot(p) < 0) {
+		if (!weapon.equals("trident") && findArrowSlot(p) < 0
+				&& !(weapon.equals("crossbow") && hasFireworkAmmo(p))) {
 			combatState = "done";
 			combatEndReason = "no_ammo";
 			return combatStatusJson();
 		}
 		// A loaded crossbow starts at the aim/fire beat; an empty one loads first.
 		combatCharged = weapon.equals("crossbow") && isCrossbowCharged(p);
+		if (weapon.equals("crossbow") && !combatCharged)
+			prepareFireworkOffhand(mc, p);
 		combatPhase = weapon.equals("crossbow") && !combatCharged ? CombatPhase.LOADING : CombatPhase.CHARGING;
 		combatState = "running";
 		combatEndReason = "running";
@@ -1137,6 +1250,11 @@ public final class BotController {
 		if (combatWeapon != null && combatWeapon.equals("crossbow")) {
 			o.addProperty("charged", combatCharged);
 		}
+		// B-08: the projectile each carried ranged weapon would use next, so the
+		// host can pick the ammo-specific ballistic profile before the task.
+		LocalPlayer statusPlayer = Minecraft.getInstance().player;
+		if (statusPlayer != null)
+			o.add("projectiles", weaponProjectiles(statusPlayer));
 		if (combatWeapon != null && combatWeapon.equals("trident") && combatShotsFired > 0) {
 			o.addProperty("returned", combatTridentReturned);
 		}
@@ -1146,6 +1264,56 @@ public final class BotController {
 			aim.addProperty("y", combatAimY);
 			aim.addProperty("z", combatAimZ);
 			o.add("aimTarget", aim);
+		}
+		// F-24: the lead the aim actually used and where it came from, so a
+		// moving-target shot can be audited without a debugger.
+		JsonObject lead = new JsonObject();
+		lead.addProperty("source", combatLeadSource);
+		if (combatLeadVelocity != null) {
+			lead.addProperty("x", combatLeadVelocity.x);
+			lead.addProperty("y", combatLeadVelocity.y);
+			lead.addProperty("z", combatLeadVelocity.z);
+		}
+		lead.addProperty("ownSpeed", combatLeadOwnSpeed);
+		lead.addProperty("vehicleFound", combatLeadVehicleFound);
+		lead.addProperty("vehicleSpeed", combatLeadVehicleSpeed);
+		lead.addProperty("measuredSpeed", combatLeadMeasuredSpeed);
+		o.add("aimLead", lead);
+		// F-26: the state the release fired with and the arrow the server
+		// actually launched, so an under-leading shot can be traced to the aim
+		// inputs, the charge level or the rotation the server had seen.
+		if (combatReleaseCaptured) {
+			JsonObject release = new JsonObject();
+			release.addProperty("holdTicks", combatReleaseHoldTicks);
+			release.addProperty("chargeTicks", combatReleaseChargeTicks);
+			release.addProperty("flightTicks", combatReleaseFlightTicks);
+			release.addProperty("leadSource", combatReleaseLeadSource);
+			JsonObject aimAtRelease = new JsonObject();
+			aimAtRelease.addProperty("x", combatReleaseAimX);
+			aimAtRelease.addProperty("y", combatReleaseAimY);
+			aimAtRelease.addProperty("z", combatReleaseAimZ);
+			release.add("aim", aimAtRelease);
+			JsonObject targetAtRelease = new JsonObject();
+			targetAtRelease.addProperty("x", combatReleaseTargetX);
+			targetAtRelease.addProperty("y", combatReleaseTargetY);
+			targetAtRelease.addProperty("z", combatReleaseTargetZ);
+			release.add("target", targetAtRelease);
+			JsonObject leadVelocity = new JsonObject();
+			leadVelocity.addProperty("x", combatReleaseLeadX);
+			leadVelocity.addProperty("y", combatReleaseLeadY);
+			leadVelocity.addProperty("z", combatReleaseLeadZ);
+			release.add("leadVelocity", leadVelocity);
+			JsonObject arrow = new JsonObject();
+			if (!Double.isNaN(combatReleaseArrowX)) {
+				arrow.addProperty("x", combatReleaseArrowX);
+				arrow.addProperty("y", combatReleaseArrowY);
+				arrow.addProperty("z", combatReleaseArrowZ);
+				arrow.addProperty("speed", Math.sqrt(combatReleaseArrowX * combatReleaseArrowX
+						+ combatReleaseArrowY * combatReleaseArrowY + combatReleaseArrowZ * combatReleaseArrowZ));
+			}
+			arrow.addProperty("observedAtTrackTick", combatReleaseArrowTick);
+			release.add("arrow", arrow);
+			o.add("release", release);
 		}
 		o.addProperty("aimSource", combatAimSource);
 		if (combatLastShotTick > 0) {
@@ -1277,6 +1445,10 @@ public final class BotController {
 		riptideState = state;
 		riptideEndReason = reason;
 		riptideUnmet = unmet;
+		// F-25: never leave the charge key held after the task.
+		Minecraft mc = Minecraft.getInstance();
+		if (mc != null && mc.options != null)
+			mc.options.keyUse.setDown(false);
 	}
 
 	/**
@@ -1437,8 +1609,7 @@ public final class BotController {
 				releaseKeys(mc.options);
 				drivingKeys = false;
 			}
-			if (jumpOnceTicks > 0) jumpOnceTicks--;
-			tickMining(mc);
+			if (jumpOnceTicks > 0) jumpOnceTicks--;			tickMining(mc);
 			// Reflex use-key hold wins over the release path above.
 			if (useHeld)
 				mc.options.keyUse.setDown(true);
@@ -1562,8 +1733,25 @@ public final class BotController {
 	private void tickCombatLoad(Minecraft mc, LocalPlayer p) {
 		aimAtTarget(mc, p);
 		combatLoadTicks++;
-		if (!p.isUsingItem())
-			mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
+		// F-25/F-28: hold the use key so the vanilla input path cannot release
+		// early, then release deliberately after the charge duration. A crossbow
+		// keeps a held use open forever (CrossbowItem#useOnRelease is true) and
+		// only loads inside releaseUsing, so a player's release is part of the
+		// load, not an interruption of it.
+		boolean releasing = combatLoadTicks % CROSSBOW_LOAD_CYCLE_TICKS > CROSSBOW_LOAD_HOLD_TICKS;
+		if (releasing) {
+			if (!combatLoadReleased) {
+				mc.options.keyUse.setDown(false);
+				mc.gameMode.releaseUsingItem(p);
+				combatLoadReleased = true;
+			}
+		}
+		else {
+			combatLoadReleased = false;
+			mc.options.keyUse.setDown(true);
+			if (!p.isUsingItem())
+				mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
+		}
 		if (isCrossbowCharged(p)) {
 			combatCharged = true;
 			combatPhase = CombatPhase.CHARGING;
@@ -1571,7 +1759,7 @@ public final class BotController {
 			return;
 		}
 		// The load is a bounded window; a crossbow that never charges fails honestly.
-		if (combatLoadTicks > 80) {
+		if (combatLoadTicks > CROSSBOW_LOAD_TIMEOUT_TICKS) {
 			combatPhase = CombatPhase.IDLE;
 			combatState = "done";
 			combatEndReason = "load_timeout";
@@ -1614,6 +1802,7 @@ public final class BotController {
 			}
 			combatShotWasCharged = true;
 			combatAmmoBefore = countAmmo(p);
+			sendAimRotation(mc, p);
 			mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
 			p.swing(InteractionHand.MAIN_HAND);
 			combatShotPending = true;
@@ -1624,6 +1813,9 @@ public final class BotController {
 			return;
 		}
 		// Bow/trident: start the charge use and hold it for chargeTicks.
+		// F-25: the key is held so the vanilla input path cannot release the use
+		// each tick while the window has no screen open.
+		mc.options.keyUse.setDown(true);
 		if (!p.isUsingItem())
 			mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
 		combatHoldTicks = 0;
@@ -1635,6 +1827,9 @@ public final class BotController {
 		boolean crossbow = combatWeapon != null && combatWeapon.equals("crossbow");
 		if (!crossbow) {
 			combatHoldTicks++;
+			// F-25: keep the use key held for the whole charge; the release path
+			// below clears it together with the release itself.
+			mc.options.keyUse.setDown(true);
 			// Re-assert the use while charging; key state alone raises no click.
 			if (!p.isUsingItem() && combatHoldTicks % 2 == 0)
 				mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
@@ -1651,6 +1846,8 @@ public final class BotController {
 			// captured before the release so a fast arrow that hits within a tick
 			// or two can still be verified by the ammo delta.
 			combatAmmoBefore = countAmmo(p);
+			captureReleaseSnapshot(mc, p);
+			sendAimRotation(mc, p);
 			mc.options.keyUse.setDown(false);
 			mc.gameMode.releaseUsingItem(p);
 			combatShotPending = true;
@@ -1699,6 +1896,15 @@ public final class BotController {
 				combatShotVerifications.add(verifiedBy);
 				if (projectile != null) {
 					combatProjectiles.add(projectile.getUUID());
+					// F-26: the first motion the client sees on its own arrow is the
+					// direction and speed the server actually launched it with.
+					if (Double.isNaN(combatReleaseArrowX)) {
+						Vec3 arrowMotion = projectile.getDeltaMovement();
+						combatReleaseArrowX = arrowMotion.x;
+						combatReleaseArrowY = arrowMotion.y;
+						combatReleaseArrowZ = arrowMotion.z;
+						combatReleaseArrowTick = combatTrackTicks;
+					}
 					if (combatWeapon != null && combatWeapon.equals("trident"))
 						combatTridentUuid = projectile.getUUID();
 				}
@@ -1745,6 +1951,11 @@ public final class BotController {
 		combatPhase = CombatPhase.IDLE;
 		combatState = state;
 		combatEndReason = reason;
+		// F-25: the use key is held while charging; never leave it held after the
+		// task, or a focused client would keep using the held item.
+		Minecraft mc = Minecraft.getInstance();
+		if (mc != null && mc.options != null)
+			mc.options.keyUse.setDown(false);
 	}
 
 	// --- MC-4e riptide task ----------------------------------------------------------------
@@ -1772,10 +1983,13 @@ public final class BotController {
 			return;
 		}
 		aimAtPoint(p, riptideTargetX, riptideTargetY, riptideTargetZ);
+		// F-25: same held-key rule as the bow charge.
+		mc.options.keyUse.setDown(true);
 		if (!p.isUsingItem())
 			mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
 		if (p.getTicksUsingItem() >= RIPTIDE_CHARGE_TICKS) {
 			// Normal release: this is the vanilla riptide launch.
+			sendAimRotation(mc, p);
 			mc.options.keyUse.setDown(false);
 			mc.gameMode.releaseUsingItem(p);
 			riptideDurabilityAfter = p.getMainHandItem().getDamageValue();
@@ -1844,6 +2058,7 @@ public final class BotController {
 		p.getInventory().setSelectedSlot(hotbar);
 		//?} else
 		p.getInventory().selected = hotbar;
+		sendCarriedItem(mc, hotbar);
 		return true;
 	}
 
@@ -1920,29 +2135,44 @@ public final class BotController {
 	private void aimAtTarget(Minecraft mc, LocalPlayer p) {
 		Entity target = currentTargetEntity(mc);
 		if (target != null) {
-			double tx = target.getX();
-			double ty = target.getY() + target.getBbHeight() * 0.5;
-			double tz = target.getZ();
-			if (combatLeadEnabled) {
-				double distance = p.getEyePosition().distanceTo(new Vec3(tx, ty, tz));
-				double flightTicks = Mth.clamp(distance / COMBAT_PROJECTILE_SPEED,
+			double baseX = target.getX();
+			double baseY = target.getY() + target.getBbHeight() * 0.5;
+			double baseZ = target.getZ();
+			double tx = baseX;
+			double ty = baseY;
+			double tz = baseZ;
+			double speed = combatLaunchSpeed(p);
+			if (combatLeadEnabled && speed > 0) {
+				Vec3 vel = combatAimVelocity(mc, target);
+				double flightTicks = Mth.clamp(p.getEyePosition().distanceTo(new Vec3(baseX, baseY, baseZ)) / speed,
 						COMBAT_MIN_FLIGHT_TICKS, COMBAT_MAX_FLIGHT_TICKS);
-				Vec3 vel = target.getDeltaMovement();
-				tx += Mth.clamp(vel.x * flightTicks, -COMBAT_MAX_LEAD_BLOCKS, COMBAT_MAX_LEAD_BLOCKS);
-				ty += Mth.clamp(vel.y * flightTicks, -COMBAT_MAX_LEAD_BLOCKS, COMBAT_MAX_LEAD_BLOCKS);
-				tz += Mth.clamp(vel.z * flightTicks, -COMBAT_MAX_LEAD_BLOCKS, COMBAT_MAX_LEAD_BLOCKS);
+				// Two lead passes: the first uses the direct distance estimate, the second the
+				// flight time the ballistic solve just produced. Both extend the lead by the
+				// fixed client interpolation window, because the position the target is read
+				// from already trails the server by that much (F-26). The aim applied below
+				// solves once more at the final lead point, so the shot and the recorded aim
+				// agree.
+				for (int pass = 0; pass < 2; pass++) {
+					double leadTicks = flightTicks + COMBAT_CLIENT_INTERP_TICKS;
+					tx = baseX + Mth.clamp(vel.x * leadTicks, -COMBAT_MAX_LEAD_BLOCKS, COMBAT_MAX_LEAD_BLOCKS);
+					ty = baseY + Mth.clamp(vel.y * leadTicks, -COMBAT_MAX_LEAD_BLOCKS, COMBAT_MAX_LEAD_BLOCKS);
+					tz = baseZ + Mth.clamp(vel.z * leadTicks, -COMBAT_MAX_LEAD_BLOCKS, COMBAT_MAX_LEAD_BLOCKS);
+					flightTicks = Mth.clamp(solveBallisticPitch(p, tx, ty, tz, speed).flightTicks(),
+							COMBAT_MIN_FLIGHT_TICKS, COMBAT_MAX_FLIGHT_TICKS);
+				}
+				combatLastFlightTicks = flightTicks + COMBAT_CLIENT_INTERP_TICKS;
 			}
 			combatAimX = tx;
 			combatAimY = ty;
 			combatAimZ = tz;
 			combatAimHasPosition = true;
 			combatAimSource = "fresh";
-			aimAtPoint(p, combatAimX, combatAimY, combatAimZ);
+			aimBallisticAtPoint(p, combatAimX, combatAimY, combatAimZ);
 			return;
 		}
 		if (combatAimHasPosition) {
 			combatAimSource = "last_seen";
-			aimAtPoint(p, combatAimX, combatAimY, combatAimZ);
+			aimBallisticAtPoint(p, combatAimX, combatAimY, combatAimZ);
 			return;
 		}
 		// Never seen the entity in render range: fall back to the pinned point.
@@ -1950,7 +2180,290 @@ public final class BotController {
 		combatAimY = combatTargetY;
 		combatAimZ = combatTargetZ;
 		combatAimSource = "pinned";
-		aimAtPoint(p, combatAimX, combatAimY, combatAimZ);
+		aimBallisticAtPoint(p, combatAimX, combatAimY, combatAimZ);
+	}
+
+	/**
+	 * Sends the current rotation before a release or use.
+	 *
+	 * The vanilla client sends its rotation with the movement packet at the
+	 * start of the tick, but the combat aim is applied at the end of the tick.
+	 * The release packet carries no rotation, so the server launches the
+	 * projectile with the previous tick's aim (F-26: arrows left with about half
+	 * the computed lead on a moving target). Sending the rotation here puts it
+	 * ahead of the release packet on the same connection, in order.
+	 */
+	private void sendAimRotation(Minecraft mc, LocalPlayer p) {
+		if (mc.getConnection() == null)
+			return;
+		mc.getConnection().send(new ServerboundMovePlayerPacket.Rot(p.getYRot(), p.getXRot(), p.onGround()));
+	}
+
+	/**
+	 * Captures the exact state the release fires with (F-26).
+	 *
+	 * The arrow's direction and speed are set by the server from the rotation
+	 * and charge it has seen, so the release-time aim, the target's position,
+	 * the lead inputs and the vanilla charge ticks have to be compared against
+	 * the arrow that actually spawns. Nothing here changes behaviour.
+	 */
+	private void captureReleaseSnapshot(Minecraft mc, LocalPlayer p) {
+		combatReleaseCaptured = true;
+		combatReleaseAimX = combatAimX;
+		combatReleaseAimY = combatAimY;
+		combatReleaseAimZ = combatAimZ;
+		Entity target = currentTargetEntity(mc);
+		if (target != null) {
+			combatReleaseTargetX = target.getX();
+			combatReleaseTargetY = target.getY();
+			combatReleaseTargetZ = target.getZ();
+		}
+		if (combatLeadVelocity != null) {
+			combatReleaseLeadX = combatLeadVelocity.x;
+			combatReleaseLeadY = combatLeadVelocity.y;
+			combatReleaseLeadZ = combatLeadVelocity.z;
+		}
+		combatReleaseLeadSource = combatLeadSource;
+		combatReleaseChargeTicks = p.getTicksUsingItem();
+		combatReleaseHoldTicks = combatHoldTicks;
+		combatReleaseFlightTicks = combatLastFlightTicks;
+		combatReleaseArrowX = Double.NaN;
+		combatReleaseArrowY = Double.NaN;
+		combatReleaseArrowZ = Double.NaN;
+		combatReleaseArrowTick = -1;
+	}
+
+	/**
+	 * Motion used for the aim lead, in blocks per tick.
+	 *
+	 * A remote passenger reports a small residual in its own delta movement
+	 * instead of the vehicle's speed, so the measured position change since the
+	 * previous aim tick leads (F-24: a lead read from the rider alone aimed at
+	 * where the target used to be). The client-side vehicle motion is a second
+	 * source for the first tick, before a measurement exists. Both measured and
+	 * vehicle values are noisy on a remote rider; measurement matched the live
+	 * rail cart (0.40 blocks/tick) while the vehicle read spiked to 0.61, so the
+	 * measurement wins whenever it is meaningful. A stationary target measures
+	 * as at rest and gets no lead.
+	 */
+	private Vec3 combatAimVelocity(Minecraft mc, Entity target) {
+		Vec3 own = target.getDeltaMovement();
+		Entity root = target.getRootVehicle();
+		Vec3 vehicle = root != null && root != target ? root.getDeltaMovement() : null;
+		long now = mc.level != null ? mc.level.getGameTime() : 0L;
+		boolean tracked = combatMotionUuid != null && combatMotionUuid.equals(target.getUUID())
+				&& combatMotionTick != Long.MIN_VALUE && now > combatMotionTick;
+		Vec3 measured = null;
+		if (tracked) {
+			double ticks = now - combatMotionTick;
+			measured = new Vec3((target.getX() - combatMotionX) / ticks, (target.getY() - combatMotionY) / ticks,
+					(target.getZ() - combatMotionZ) / ticks);
+		}
+		Vec3 choice;
+		if (measured != null && measured.lengthSqr() > COMBAT_MIN_MOTION_SQR) {
+			choice = measured;
+			combatLeadSource = "measured";
+		}
+		else if (vehicle != null && vehicle.lengthSqr() > COMBAT_MIN_MOTION_SQR) {
+			choice = vehicle;
+			combatLeadSource = "vehicle";
+		}
+		else {
+			choice = own;
+			combatLeadSource = "own";
+		}
+		combatLeadVelocity = choice;
+		combatLeadOwnSpeed = own.length();
+		combatLeadVehicleFound = vehicle != null;
+		combatLeadVehicleSpeed = vehicle != null ? vehicle.length() : -1.0;
+		combatLeadMeasuredSpeed = measured != null ? measured.length() : -1.0;
+		combatMotionUuid = target.getUUID();
+		combatMotionTick = now;
+		combatMotionX = target.getX();
+		combatMotionY = target.getY();
+		combatMotionZ = target.getZ();
+		return choice;
+	}
+
+	/**
+	 * Launch speed for the charge the held weapon will release at, or zero when unknown.
+	 *
+	 * The bow follows the vanilla power curve for {@code combatChargeTicks} (a release past the
+	 * full draw keeps power 1); a loaded crossbow reports its projectile's speed; the trident
+	 * throws at its fixed speed. An unknown weapon keeps the straight-aim path.
+	 */
+	private double combatLaunchSpeed(LocalPlayer p) {
+		if (combatWeapon == null)
+			return 0;
+		if (combatWeapon.equals("bow")) {
+			double ratio = Math.min(Math.max(combatChargeTicks, 0), BALLISTIC_BOW_FULL_CHARGE_TICKS)
+					/ (double) BALLISTIC_BOW_FULL_CHARGE_TICKS;
+			double power = Math.min((ratio * ratio + 2.0 * ratio) / 3.0, 1.0);
+			return power * BALLISTIC_BOW_MAX_SPEED;
+		}
+		if (combatWeapon.equals("crossbow"))
+			return crossbowFireworkLoaded(p) ? BALLISTIC_CROSSBOW_FIREWORK_SPEED : BALLISTIC_CROSSBOW_ARROW_SPEED;
+		if (combatWeapon.equals("trident"))
+			return BALLISTIC_TRIDENT_SPEED;
+		return 0;
+	}
+
+	/**
+	 * Downward acceleration for the current weapon's projectile.
+	 *
+	 * B-08: a crossbow firework rocket flies straight after launch (its thrust is
+	 * not modelled), so it must not inherit the arrow's gravity drop.
+	 */
+	private double combatGravity(LocalPlayer p) {
+		if (combatWeapon != null && combatWeapon.equals("crossbow") && crossbowFireworkLoaded(p))
+			return 0.0;
+		return BALLISTIC_GRAVITY;
+	}
+
+	/** True when the loaded crossbow holds a firework rocket, whose shot speed is 1.6. */
+	private boolean crossbowFireworkLoaded(LocalPlayer p) {
+		ItemStack held = p.getMainHandItem();
+		if (held.isEmpty())
+			return false;
+		ChargedProjectiles charged = held.get(DataComponents.CHARGED_PROJECTILES);
+		if (charged == null)
+			return false;
+		for (ItemStack projectile : charged.getItems()) {
+			if (projectile.is(Items.FIREWORK_ROCKET))
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Aims at a point with the launch pitch that lands the projectile there.
+	 *
+	 * The yaw is the plain horizontal direction; the pitch comes from
+	 * {@link #solveBallisticPitch}. An unknown weapon (speed 0) falls back to the straight aim
+	 * that pointed at the target itself.
+	 */
+	private void aimBallisticAtPoint(LocalPlayer p, double tx, double ty, double tz) {
+		double speed = combatLaunchSpeed(p);
+		if (speed <= 0) {
+			aimAtPoint(p, tx, ty, tz);
+			return;
+		}
+		float yaw = (float) ((Mth.atan2(tz - p.getZ(), tx - p.getX()) * (180.0 / Math.PI)) - 90.0);
+		float pitch = (float) solveBallisticPitch(p, tx, ty, tz, speed).pitch();
+		p.setYRot(yaw);
+		p.setXRot(Mth.clamp(pitch, -90.0F, 90.0F));
+		p.setYHeadRot(yaw);
+		p.setYBodyRot(yaw);
+	}
+
+	/**
+	 * Solves the launch pitch for the aim point with a coarse-to-fine candidate search.
+	 *
+	 * Candidates are simulated with the audited arrow model; the winner is the earliest hit,
+	 * then the flattest arc, and the closest approach on a miss. The returned flight time lets
+	 * the caller converge its lead instead of estimating it with {@code distance / speed}.
+	 */
+	private BallisticAim solveBallisticPitch(LocalPlayer p, double tx, double ty, double tz, double speed) {
+		double yawDeg = (Math.atan2(tz - p.getZ(), tx - p.getX()) * (180.0 / Math.PI)) - 90.0;
+		double pitchStep = (BALLISTIC_PITCH_MAX_DEG - BALLISTIC_PITCH_MIN_DEG) / BALLISTIC_COARSE_STEPS;
+		BallisticShot best = null;
+		for (int index = 0; index <= BALLISTIC_COARSE_STEPS; index++) {
+			BallisticShot shot = simulateBallisticShot(p, tx, ty, tz, speed, yawDeg, BALLISTIC_PITCH_MIN_DEG + index * pitchStep);
+			if (best == null || shot.score() < best.score())
+				best = shot;
+		}
+		for (double offset : BALLISTIC_REFINE_OFFSETS) {
+			BallisticShot shot = simulateBallisticShot(p, tx, ty, tz, speed, yawDeg, best.pitch() + offset);
+			if (shot.score() < best.score())
+				best = shot;
+		}
+		for (double offset : BALLISTIC_FINE_OFFSETS) {
+			BallisticShot shot = simulateBallisticShot(p, tx, ty, tz, speed, yawDeg, best.pitch() + offset);
+			if (shot.score() < best.score())
+				best = shot;
+		}
+		return new BallisticAim(best.pitch(), Math.max(1, best.tick()), best.hit());
+	}
+
+	/**
+	 * Simulates one pitch candidate.
+	 *
+	 * The model mirrors `AbstractArrow#tick`: the tick segment is tested for the closest
+	 * approach first, then drag and gravity update the velocity for the next tick. The launch
+	 * direction mirrors `Projectile#shootFromRotation`; the bow and trident inherit the
+	 * shooter's movement, the crossbow does not.
+	 */
+	private BallisticShot simulateBallisticShot(LocalPlayer p, double tx, double ty, double tz, double speed, double yawDeg, double pitchDeg) {
+		double yaw = Math.toRadians(yawDeg);
+		double pitch = Math.toRadians(pitchDeg);
+		double horizontal = Math.cos(pitch);
+		double vx = -Math.sin(yaw) * horizontal * speed;
+		double vy = -Math.sin(pitch) * speed;
+		double vz = Math.cos(yaw) * horizontal * speed;
+		if (!combatWeapon.equals("crossbow")) {
+			Vec3 shooter = p.getDeltaMovement();
+			vx += shooter.x;
+			vy += p.onGround() ? 0 : shooter.y;
+			vz += shooter.z;
+		}
+		double px = p.getX();
+		double py = p.getEyeY() + BALLISTIC_SPAWN_OFFSET_Y;
+		double pz = p.getZ();
+		// A curve that passes the target's horizontal distance can never come
+		// back to it (horizontal motion is monotone), so the search stops there.
+		double targetReach = Math.hypot(tx - px, tz - pz) + BALLISTIC_PAST_TARGET_MARGIN;
+		Level level = Minecraft.getInstance().level;
+		double closest = Double.POSITIVE_INFINITY;
+		int closestTick = 1;
+		double peakY = py;
+		boolean blocked = false;
+		for (int tick = 1; tick <= BALLISTIC_MAX_TICKS; tick++) {
+			double nx = px + vx;
+			double ny = py + vy;
+			double nz = pz + vz;
+			vx *= BALLISTIC_AIR_INERTIA;
+			vy = vy * BALLISTIC_AIR_INERTIA - combatGravity(p);
+			vz *= BALLISTIC_AIR_INERTIA;
+			// Terrain the arrow would hit first disqualifies this curve. The
+			// client world is the same world the arrow flies in, so the check
+			// needs no RPC; the clip uses vanilla block collision shapes.
+			if (level != null) {
+				HitResult clip = level.clip(new ClipContext(new Vec3(px, py, pz), new Vec3(nx, ny, nz), ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, p));
+				if (clip.getType() != HitResult.Type.MISS) {
+					blocked = true;
+					break;
+				}
+			}
+			double distance = distanceToSegment(tx, ty, tz, px, py, pz, nx, ny, nz);
+			if (distance < closest) {
+				closest = distance;
+				closestTick = tick;
+			}
+			if (ny > peakY)
+				peakY = ny;
+			px = nx;
+			py = ny;
+			pz = nz;
+			if (closest <= BALLISTIC_HIT_RADIUS || py < -128.0)
+				break;
+			if (Math.hypot(px - p.getX(), pz - p.getZ()) > targetReach)
+				break;
+		}
+		return new BallisticShot(pitchDeg, closest, closestTick, peakY, blocked);
+	}
+
+	/** Distance from a point to the segment (ax,ay,az)-(bx,by,bz). */
+	private static double distanceToSegment(double x, double y, double z, double ax, double ay, double az, double bx, double by, double bz) {
+		double dx = bx - ax;
+		double dy = by - ay;
+		double dz = bz - az;
+		double lengthSquared = dx * dx + dy * dy + dz * dz;
+		double t = lengthSquared < 1.0E-9 ? 0.0 : ((x - ax) * dx + (y - ay) * dy + (z - az) * dz) / lengthSquared;
+		t = Mth.clamp(t, 0.0, 1.0);
+		double cx = ax + dx * t - x;
+		double cy = ay + dy * t - y;
+		double cz = az + dz * t - z;
+		return Math.sqrt(cx * cx + cy * cy + cz * cz);
 	}
 
 	/** The pinned target entity in the client world, or null when out of range. */
@@ -2002,10 +2515,14 @@ public final class BotController {
 			String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
 			boolean matches = trident
 					? id.equals("minecraft:trident")
-					: id.equals("minecraft:arrow") || id.endsWith("_arrow");
+					: id.equals("minecraft:arrow") || id.endsWith("_arrow")
+							|| (combatWeapon != null && combatWeapon.equals("crossbow") && id.equals("minecraft:firework_rocket"));
 			if (matches)
 				count += stack.getCount();
 		}
+		// B-08: a prepared crossbow keeps its rockets in the off hand.
+		if (!trident && combatWeapon != null && combatWeapon.equals("crossbow") && p.getOffhandItem().is(Items.FIREWORK_ROCKET))
+			count += p.getOffhandItem().getCount();
 		return count;
 	}
 
@@ -2018,9 +2535,13 @@ public final class BotController {
 				continue;
 			boolean isArrow = e instanceof AbstractArrow;
 			boolean isTrident = e instanceof ThrownTrident;
-			if (!isArrow && !isTrident)
+			boolean isFirework = e instanceof FireworkRocketEntity;
+			if (!isArrow && !isTrident && !isFirework)
 				continue;
 			if (expectTrident != isTrident)
+				continue;
+			// B-08: a firework rocket is this task's projectile only for a crossbow.
+			if (isFirework && (combatWeapon == null || !combatWeapon.equals("crossbow")))
 				continue;
 			// Owner is a Projectile accessor, not an Entity one.
 			Entity owner = e instanceof Projectile projectile ? projectile.getOwner() : null;
@@ -2090,7 +2611,46 @@ public final class BotController {
 		p.getInventory().setSelectedSlot(hotbar);
 		//?} else
 		p.getInventory().selected = hotbar;
+		sendCarriedItem(mc, hotbar);
 		return true;
+	}
+
+	/**
+	 * Sends the held slot to the server (B-08).
+	 *
+	 * The inventory's selected slot is client-side state; vanilla only sends the
+	 * carried-item packet from its own hotbar input. A weapon or tool swap done by
+	 * the bot must announce the slot itself, or a use acts on the previous item
+	 * and a crossbow load never charges.
+	 */
+	private void sendCarriedItem(Minecraft mc, int hotbar) {
+		if (mc.getConnection() != null)
+			mc.getConnection().send(new ServerboundSetCarriedItemPacket(hotbar));
+	}
+
+	/**
+	 * B-08: moves one firework rocket to the off hand for a crossbow load.
+	 *
+	 * A crossbow's held-projectile check accepts arrows or fireworks, but its
+	 * inventory scan is arrows only, so a firework in the backpack never loads.
+	 * With no arrows in the inventory the load must take the off-hand rocket; if
+	 * the off hand already holds one, or arrows exist and win the draw, nothing
+	 * changes.
+	 */
+	private void prepareFireworkOffhand(Minecraft mc, LocalPlayer p) {
+		if (findArrowSlot(p) >= 0)
+			return;
+		if (p.getOffhandItem().is(Items.FIREWORK_ROCKET))
+			return;
+		int slot = findFireworkSlot(p);
+		if (slot < 0 || slot > 35)
+			return;
+		MultiPlayerGameMode gm = mc.gameMode;
+		if (gm == null)
+			return;
+		int containerId = p.inventoryMenu.containerId;
+		containerClick(gm, containerId, toMenuSlot(slot), p);
+		containerClick(gm, containerId, 45, p);
 	}
 
 	private int findArrowSlot(LocalPlayer p) {
@@ -2102,8 +2662,94 @@ public final class BotController {
 		return -1;
 	}
 
-	private boolean isCrossbowCharged(LocalPlayer p) {
-		ItemStack held = p.getMainHandItem();
+	/** B-08: slot of a firework rocket, the crossbow's second supported ammo. */
+	private int findFireworkSlot(LocalPlayer p) {
+		for (int slot = 0; slot <= 35; slot++) {
+			ItemStack stack = p.getInventory().getItem(slot);
+			if (!stack.isEmpty() && stack.is(Items.FIREWORK_ROCKET))
+				return slot;
+		}
+		return -1;
+	}
+
+	/**
+	 * B-08: firework ammo for a crossbow, including the rocket already in the off
+	 * hand. A prepared crossbow keeps its rockets there (the only slot the vanilla
+	 * held-projectile check accepts), so the inventory scan alone would report
+	 * {@code no_ammo} once the stack has moved.
+	 */
+	private boolean hasFireworkAmmo(LocalPlayer p) {
+		return p.getOffhandItem().is(Items.FIREWORK_ROCKET) || findFireworkSlot(p) >= 0;
+	}
+
+	/**
+	 * B-08: the projectile each carried ranged weapon would use next.
+	 *
+	 * A charged crossbow reports its loaded stack; an unloaded one reports the
+	 * vanilla draw order (arrows first, then a firework rocket). A bow reports the
+	 * next stack its projectile lookup would draw. Empty when the ammo is missing
+	 * or no such weapon is carried.
+	 */
+	private JsonObject weaponProjectiles(LocalPlayer p) {
+		JsonObject out = new JsonObject();
+		out.addProperty("bow", bowProjectileId(p));
+		out.addProperty("crossbow", crossbowProjectileId(p));
+		out.addProperty("trident", carried(p, Items.TRIDENT) ? "minecraft:trident" : "");
+		return out;
+	}
+
+	private String bowProjectileId(LocalPlayer p) {
+		for (int slot = 0; slot <= 35; slot++) {
+			ItemStack stack = p.getInventory().getItem(slot);
+			if (stack.isEmpty() || !stack.is(Items.BOW))
+				continue;
+			ItemStack drawn = p.getProjectile(stack);
+			if (!drawn.isEmpty())
+				return BuiltInRegistries.ITEM.getKey(drawn.getItem()).toString();
+		}
+		return "";
+	}
+
+	private String crossbowProjectileId(LocalPlayer p) {
+		boolean hasCrossbow = false;
+		for (int slot = 0; slot <= 35; slot++) {
+			ItemStack stack = p.getInventory().getItem(slot);
+			if (stack.isEmpty() || !stack.is(Items.CROSSBOW))
+				continue;
+			hasCrossbow = true;
+			ChargedProjectiles charged = stack.get(DataComponents.CHARGED_PROJECTILES);
+			if (charged != null) {
+				for (ItemStack projectile : charged.getItems()) {
+					if (!projectile.isEmpty())
+						return BuiltInRegistries.ITEM.getKey(projectile.getItem()).toString();
+				}
+			}
+		}
+		if (!hasCrossbow)
+			return "";
+		// The vanilla held-projectile check runs before the inventory scan, so an
+		// off-hand firework rocket is what the load would take first.
+		if (p.getOffhandItem().is(Items.FIREWORK_ROCKET))
+			return BuiltInRegistries.ITEM.getKey(p.getOffhandItem().getItem()).toString();
+		int arrowSlot = findArrowSlot(p);
+		if (arrowSlot >= 0)
+			return BuiltInRegistries.ITEM.getKey(p.getInventory().getItem(arrowSlot).getItem()).toString();
+		int fireworkSlot = findFireworkSlot(p);
+		if (fireworkSlot >= 0)
+			return BuiltInRegistries.ITEM.getKey(p.getInventory().getItem(fireworkSlot).getItem()).toString();
+		return "";
+	}
+
+	private boolean carried(LocalPlayer p, Item item) {
+		for (int slot = 0; slot <= 35; slot++) {
+			ItemStack stack = p.getInventory().getItem(slot);
+			if (!stack.isEmpty() && stack.is(item))
+				return true;
+		}
+		return false;
+	}
+
+	private boolean isCrossbowCharged(LocalPlayer p) {		ItemStack held = p.getMainHandItem();
 		if (held.isEmpty())
 			return false;
 		ChargedProjectiles charged = held.get(DataComponents.CHARGED_PROJECTILES);

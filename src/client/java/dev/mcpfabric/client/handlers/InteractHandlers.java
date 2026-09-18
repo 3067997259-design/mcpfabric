@@ -19,6 +19,8 @@ import net.minecraft.world.entity.animal.horse.AbstractHorse;
 import net.minecraft.world.entity.monster.Strider;
 import net.minecraft.world.entity.vehicle.AbstractMinecart;
 import net.minecraft.world.entity.vehicle.Boat;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.ThrowablePotionItem;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
@@ -194,6 +196,23 @@ public final class InteractHandlers {
 			MultiPlayerGameMode gm = ClientMc.gameMode();
 			LocalPlayer p = ClientMc.player();
 			Entity e = findEntity(ctx.getString("uuid"));
+			// B-08: a thrown potion is thrown along the look direction, not at the
+			// entity. Aim at the target and use the item when the held stack is a
+			// throwable, so a splash or lingering potion lands on the target.
+			ItemStack held = p.getMainHandItem();
+			if (held.getItem() instanceof ThrowablePotionItem) {
+				double dx = e.getX() - p.getX();
+				double dy = (e.getY() + e.getBbHeight() * 0.5) - p.getEyeY();
+				double dz = e.getZ() - p.getZ();
+				double horizontal = Math.sqrt(dx * dx + dz * dz);
+				p.setYRot((float) (Math.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0F);
+				p.setXRot((float) -Math.toDegrees(Math.atan2(dy, horizontal)));
+				InteractionResult result = gm.useItem(p, InteractionHand.MAIN_HAND);
+				JsonObject o = new JsonObject();
+				o.addProperty("result", String.valueOf(result));
+				o.addProperty("thrown", true);
+				return o;
+			}
 			//? if <26.1 {
 			InteractionResult result = gm.interact(p, e, InteractionHand.MAIN_HAND);
 			//?} else

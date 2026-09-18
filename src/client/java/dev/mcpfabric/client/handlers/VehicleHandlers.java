@@ -182,8 +182,15 @@ public final class VehicleHandlers {
 	private static void describeMinecart(AbstractMinecart cart, JsonObject o) {
 		Vec3 motion = cart.getDeltaMovement();
 		o.addProperty("speed", Math.sqrt(motion.x * motion.x + motion.z * motion.z));
-		BlockPos below = BlockPos.containing(cart.getX(), cart.getY() - 0.5, cart.getZ());
-		BlockState state = cart.level().getBlockState(below);
+		// NOTICE: a cart riding a rail has its position inside the rail's own
+		// cell (rail block y + 0.0625 on flat track). The previous read used
+		// `y - 0.5`, which landed in the block under the rail, so a powered rail
+		// reported onRail:false and powered:false and every cart trip failed
+		// with rail_not_powered (live F-15, 2026-09-17: a verified
+		// powered_rail[powered=true] under the cart still read as unpowered).
+		// The cart's own block cell is the rail cell on flat and sloped track.
+		BlockPos cell = cart.blockPosition();
+		BlockState state = cart.level().getBlockState(cell);
 		boolean rail = state.getBlock() instanceof BaseRailBlock;
 		o.addProperty("onRail", rail);
 		boolean powered = state.getBlock() instanceof PoweredRailBlock && state.getValue(PoweredRailBlock.POWERED);
