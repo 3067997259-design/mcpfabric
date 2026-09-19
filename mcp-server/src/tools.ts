@@ -582,6 +582,41 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {},
     annotations: WRITE,
   },
+  {
+    name: "elytra_launch",
+    method: "movement.elytraLaunch",
+    title: "Launch the elytra from flat ground",
+    description:
+      "Client-only. Run the per-tick launch macro: jump, release the jump key, deploy the glider, spend one rocket to climb, then hand over. Works from flat ground with no edge or runway. Reports the task state, phase (prepare/jump/release-jump/deploy/boost/handoff), whether the bot is airborne, whether the glider opened, whether it is climbing, and the fireworks spent. Fails with a typed endReason (no_elytra/grounded/not_deployed/no_fireworks/no_climb/deadline/cancelled/no_player).",
+    inputSchema: {
+      goalX: z.number().optional().describe("Direction of travel; the macro aims the climb along it."),
+      goalY: z.number().optional(),
+      goalZ: z.number().optional(),
+      deadlineMs: z.number().int().positive().optional().describe("Hard cap on the whole macro, in ms."),
+      withFireworks: z.boolean().optional().describe("False when no rocket is available: the macro then only deploys and reports no_fireworks."),
+      controlSessionId: z.string().optional().describe("Input-ownership session id (CD-0). Omit for unscoped legacy callers."),
+      sequence: z.number().int().nonnegative().optional().describe("Monotonic sequence within the control session."),
+    },
+    annotations: WRITE,
+  },
+  {
+    name: "elytra_launch_status",
+    method: "movement.elytraLaunchStatus",
+    title: "Elytra launch status",
+    description:
+      "Client-only. Report the per-tick launch macro: state (idle/running/done/failed/cancelled), endReason, phase, ticks, airborne/deployed/jumpReleased/deployPressed/boostPressed/boostSeen, fireworksUsed, the climb from the start height, and the live position and vertical speed.",
+    inputSchema: {},
+    annotations: READ,
+  },
+  {
+    name: "elytra_launch_cancel",
+    method: "movement.elytraLaunchCancel",
+    title: "Abort the elytra launch",
+    description:
+      "Client-only. Abort an in-flight launch macro and release every key it held. Reports the cancelled task state.",
+    inputSchema: {},
+    annotations: WRITE,
+  },
 
   // ===== control (client) ====================================================================
   {

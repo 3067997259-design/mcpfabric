@@ -55,6 +55,28 @@ public final class MovementHandlers {
 			return ClientMc.call(() -> BotController.get().cancelJump());
 		});
 
+		// OV-5: flat-ground elytra launch. The deploy has to land on the exact
+		// tick after the jump key is released, and the boost has to be fired from
+		// the airborne state, so the tick-by-tick sequence lives in the
+		// controller (OV-D15) and these handlers only start it, report it, and
+		// abort it.
+		router.register("movement.elytraLaunch", ctx -> {
+			requireControl();
+			double goalX = ctx.optDouble("goalX", 0);
+			double goalY = ctx.optDouble("goalY", 0);
+			double goalZ = ctx.optDouble("goalZ", 0);
+			long deadlineMs = ctx.optLong("deadlineMs", System.currentTimeMillis() + 6_000);
+			boolean withFireworks = ctx.optBool("withFireworks", true);
+			return ClientMc.call(() -> BotController.get().startLaunch(goalX, goalY, goalZ, deadlineMs, withFireworks));
+		});
+
+		router.register("movement.elytraLaunchStatus", ctx -> ClientMc.call(() -> BotController.get().launchStatusJson()));
+
+		router.register("movement.elytraLaunchCancel", ctx -> {
+			requireControl();
+			return ClientMc.call(() -> BotController.get().cancelLaunch());
+		});
+
 		router.register("movement.riptide", ctx -> {
 			requireControl();
 			double tx = ctx.getDouble("targetX");

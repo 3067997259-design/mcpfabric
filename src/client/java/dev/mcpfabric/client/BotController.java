@@ -16,6 +16,7 @@ import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.projectile.AbstractArrow;
 import net.minecraft.world.entity.projectile.FireworkRocketEntity;
 import net.minecraft.world.entity.projectile.Projectile;
@@ -405,6 +406,390 @@ public final class BotController {
 	/** Completed edges of the running task, as `edgeId@x,y,z|vx,vz`. */
 	private final List<String> jumpCompletedEdges = new ArrayList<>();
 	private volatile int jumpCompletedCount;
+
+	// --- elytra launch macro (OV-5 / OV-D15) -------------------------------------------------
+	//
+	// One per-tick task that gets a glider airborne from flat ground. It exists
+	// because the host-side sequence cannot press keys on the tick it needs to:
+	// the host polls at 100-200 ms, while the deploy has to happen in a specific
+	// tick right after the jump key is released, and the boost has to be fired
+	// from the airborne state rather than from a poll guess.
+	//
+	// The phase order is not cosmetic. `applyKeys` below writes
+	// `keyJump.setDown(jumpHeld || jumpOnceTicks > 0)`, and a HELD key is not a
+	// new press, so a deploy attempted while `jumpHeld` is still true does
+	// nothing at all: live runs off a ridge fell 24+ blocks with
+	// `fallFlying: false` while the sprint keys stayed held. Hence the explicit
+	// RELEASE phase with its own tick budget between the run and the deploy.
+	//
+	// Phase advances read real state (airborne, key released, gliding, speed
+	// gained), never "two or three ticks have passed, so it must be ready".
+	private volatile String launchState = "idle";
+	private volatile String launchEndReason = "idle";
+	private volatile String launchPhase = "idle";
+	private int launchTicks;
+	private long launchDeadline;
+	private double launchGoalX, launchGoalY, launchGoalZ;
+	private boolean launchGoalSet;
+	private boolean launchAirborneSeen;
+	private boolean launchDeployedSeen;
+	private boolean launchJumpReleasedSeen;
+	private boolean launchDeployPressed;
+	private boolean launchRocketPrepared;
+	private boolean launchBoostPressed;
+	private boolean launchBoostSeen;
+	private int launchBoostWaitTicks;
+	private int launchJumpWaitTicks;
+	private int launchReleaseWaitTicks;
+	private int launchDeployWaitTicks;
+	private int launchFireworksUsed;
+	private double launchStartY;
+	private double launchMinY;
+	private double launchMaxY;
+	private double launchFarthestY;
+	private boolean launchWithFireworks;
+
+	private static final int LAUNCH_JUMP_TIMEOUT_TICKS = 10;
+	private static final int LAUNCH_RELEASE_TIMEOUT_TICKS = 8;
+	private static final int LAUNCH_DEPLOY_TIMEOUT_TICKS = 20;
+	private static final int LAUNCH_BOOST_TIMEOUT_TICKS = 60;
+	/** Pitch held during the boost; the rocket accelerates along the look vector. */
+	private static final float LAUNCH_CLIMB_PITCH = -35.0F;
+	/** Vertical speed that counts as a real climb rather than the deploy dip. */
+	private static final double LAUNCH_CLIMB_SPEED = 0.05;
+
+	/**
+	 * Starts the elytra launch macro: airborne from wherever the bot stands.
+	 *
+	 * @param goalX,goalY,goalZ direction of travel; the macro only uses it to aim
+	 *                          the boost for a useful climb, the host owns the
+	 *                          actual navigation after the handoff.
+	 * @param deadlineMillis    hard cap on the whole macro.
+	 * @param withFireworks     false when no rocket is available; the macro then
+	 *                          only deploys and reports `no_fireworks` at the
+	 *                          boost phase instead of pretending it climbed.
+	 */
+	public synchronized JsonObject startLaunch(double goalX, double goalY, double goalZ, long deadlineMillis, boolean withFireworks) {
+		launchGoalX = goalX;
+		launchGoalY = goalY;
+		launchGoalZ = goalZ;
+		launchGoalSet = true;
+		launchDeadline = deadlineMillis;
+		launchWithFireworks = withFireworks;
+		launchTicks = 0;
+		launchJumpWaitTicks = 0;
+		launchReleaseWaitTicks = 0;
+		launchDeployWaitTicks = 0;
+		launchBoostWaitTicks = 0;
+		launchAirborneSeen = false;
+		launchDeployedSeen = false;
+		launchJumpReleasedSeen = false;
+		launchDeployPressed = false;
+		launchRocketPrepared = false;
+		launchBoostPressed = false;
+		launchBoostSeen = false;
+		launchFireworksUsed = 0;
+		launchPhase = "prepare";
+		launchState = "running";
+		launchEndReason = "running";
+		stopAllMovement();
+		return launchStatusJson();
+	}
+
+	public synchronized JsonObject cancelLaunch() {
+		if (launchState.equals("running")) {
+			launchState = "cancelled";
+			launchEndReason = "cancelled";
+			stopAllMovement();
+		}
+		return launchStatusJson();
+	}
+
+	public synchronized boolean isLaunchActive() {
+		return launchState.equals("running");
+	}
+
+	public synchronized JsonObject launchStatusJson() {
+		JsonObject o = new JsonObject();
+		o.addProperty("state", launchState);
+		o.addProperty("endReason", launchEndReason);
+		o.addProperty("phase", launchPhase);
+		o.addProperty("ticks", launchTicks);
+		o.addProperty("airborne", launchAirborneSeen);
+		o.addProperty("deployed", launchDeployedSeen);
+		o.addProperty("jumpReleased", launchJumpReleasedSeen);
+		o.addProperty("deployPressed", launchDeployPressed);
+		o.addProperty("boostPressed", launchBoostPressed);
+		o.addProperty("boostSeen", launchBoostSeen);
+		o.addProperty("fireworksUsed", launchFireworksUsed);
+		o.addProperty("withFireworks", launchWithFireworks);
+		o.addProperty("startY", launchStartY);
+		o.addProperty("minY", launchMinY);
+		o.addProperty("maxY", launchMaxY);
+		o.addProperty("climb", launchMaxY - launchStartY);
+		// Live observation at the read time, so the host reports the handoff with
+		// the state it actually handed over from instead of the last vote.
+		LocalPlayer p = Minecraft.getInstance().player;
+		if (p != null) {
+			o.addProperty("gliding", p.isFallFlying());
+			o.addProperty("onGround", p.onGround());
+			o.addProperty("verticalSpeed", p.getDeltaMovement().y);
+			JsonObject position = new JsonObject();
+			position.addProperty("x", p.getX());
+			position.addProperty("y", p.getY());
+			position.addProperty("z", p.getZ());
+			o.add("position", position);
+		}
+		return o;
+	}
+
+	private void finishLaunch(String state, String reason) {
+		launchState = state;
+		launchEndReason = reason;
+		stopAllMovement();
+	}
+
+	/**
+	 * One tick of the launch macro.
+	 *
+	 * <p>Success is the handoff state: gliding, climbing, and the rocket already
+	 * spent. Everything else reports a typed reason so the host can fall back to
+	 * its own takeoff path or refuse honestly.
+	 */
+	private void tickLaunch(Minecraft mc, LocalPlayer p) {
+		launchTicks++;
+		if (p == null) {
+			finishLaunch("failed", "no_player");
+			return;
+		}
+		if (System.currentTimeMillis() > launchDeadline) {
+			finishLaunch("failed", "deadline");
+			return;
+		}
+		if (launchTicks == 1) {
+			launchStartY = p.getY();
+			launchMinY = launchStartY;
+			launchMaxY = launchStartY;
+			launchFarthestY = launchStartY;
+		}
+		launchMinY = Math.min(launchMinY, p.getY());
+		launchMaxY = Math.max(launchMaxY, p.getY());
+		if (p.onGround()) launchFarthestY = Math.max(launchFarthestY, p.getY());
+
+		boolean gliding = p.isFallFlying();
+		if (!p.onGround()) launchAirborneSeen = true;
+		if (gliding) launchDeployedSeen = true;
+		boolean hasRocketInHand = p.getOffhandItem().is(Items.FIREWORK_ROCKET);
+		boolean climbing = p.getDeltaMovement().y > LAUNCH_CLIMB_SPEED;
+
+		// Already gliding when the macro starts: nothing to launch, hand over.
+		if (launchTicks == 1 && gliding) {
+			launchPhase = "handoff";
+			finishLaunch("done", "launched");
+			return;
+		}
+
+		if (launchPhase.equals("prepare")) {
+			stopAllMovement();
+			launchJumpWaitTicks++;
+			// Readiness is the first advance basis (OV-D15): the macro must not
+			// spend a jump on a glider the bot is not wearing. The host equips the
+			// suit before it calls in, so a failure here means the equip did not
+			// land, not that the suit is missing from the inventory.
+			if (!p.getItemBySlot(EquipmentSlot.CHEST).is(Items.ELYTRA)) {
+				finishLaunch("failed", "no_elytra");
+				return;
+			}
+			if (launchJumpWaitTicks >= 1) {
+				launchPhase = "jump";
+				launchJumpWaitTicks = 0;
+			}
+			return;
+		}
+
+		if (launchPhase.equals("jump")) {
+			launchJumpWaitTicks++;
+			// A jump from a standstill is enough: the glider needs no runway, and
+			// the sprint that used to precede it is what suppressed the deploy.
+			jumpOnce();
+			if (!p.onGround()) {
+				launchPhase = "release-jump";
+				launchReleaseWaitTicks = 0;
+				return;
+			}
+			if (launchJumpWaitTicks > LAUNCH_JUMP_TIMEOUT_TICKS) {
+				finishLaunch("failed", "grounded");
+			}
+			return;
+		}
+
+		if (launchPhase.equals("release-jump")) {
+			// The glider may already be open: vanilla's deploy check runs on the
+			// held key once the bot is airborne and past the jump tick, so the
+			// release phase must read that state instead of pressing again.
+			if (gliding) {
+				launchPhase = "boost";
+				launchBoostWaitTicks = 0;
+				return;
+			}
+			// Otherwise the whole point of this phase: keyJump must observe a
+			// released tick before the deploy press can register as a new press.
+			stopAllMovement();
+			launchReleaseWaitTicks++;
+			if (launchReleaseWaitTicks >= 1) {
+				launchJumpReleasedSeen = true;
+				launchPhase = "deploy";
+				launchDeployWaitTicks = 0;
+				return;
+			}
+			if (launchReleaseWaitTicks > LAUNCH_RELEASE_TIMEOUT_TICKS) {
+				finishLaunch("failed", "not_deployed");
+			}
+			return;
+		}
+
+		if (launchPhase.equals("deploy")) {
+			launchDeployWaitTicks++;
+			if (gliding) {
+				launchPhase = "boost";
+				launchBoostWaitTicks = 0;
+				return;
+			}
+			if (p.onGround()) {
+				// Back down: the jump that carried the bot is over, so no further
+				// press can open the glider from this launch.
+				finishLaunch("failed", "not_deployed");
+				return;
+			}
+			if (launchDeployWaitTicks > LAUNCH_DEPLOY_TIMEOUT_TICKS) {
+				finishLaunch("failed", "not_deployed");
+				return;
+			}
+			// Only a RISING EDGE opens the glider (see the class comment), and
+			// `jumpOnce` holds the key for two ticks. One press therefore needs a
+			// released tick in front of it, and the retry runs on a three-tick
+			// cycle: press, release, rest.
+			int deployCycle = launchDeployWaitTicks % 3;
+			if (deployCycle == 1) {
+				stopAllMovement();
+				jumpOnce();
+				launchDeployPressed = true;
+			}
+			else if (deployCycle == 2) {
+				stopAllMovement();
+			}
+			return;
+		}
+
+		if (launchPhase.equals("boost")) {
+			launchBoostWaitTicks++;
+			if (!gliding) {
+				finishLaunch("failed", "not_deployed");
+				return;
+			}
+			if (!launchWithFireworks) {
+				finishLaunch("failed", "no_fireworks");
+				return;
+			}
+			if (!launchRocketPrepared) {
+				equipRocketOffhand(mc, p);
+				launchRocketPrepared = true;
+				return;
+			}
+			if (!launchBoostPressed) {
+				// The boost uses whichever hand holds a rocket. The crossbow path
+				// parks one in the offhand; the host's thrust path selects a hotbar
+				// stack into the main hand, so both hands are legitimate here.
+				boolean mainHand = p.getMainHandItem().is(Items.FIREWORK_ROCKET);
+				if (!mainHand && !hasRocketInHand) {
+					// The rocket move had its tick and no rocket arrived. Pressing use
+					// anyway would place or swing whatever the main hand holds while
+					// the bot is airborne and slow.
+					finishLaunch("failed", "no_fireworks");
+					return;
+				}
+				aimForClimb(p);
+				// The use goes out for one hand only. Vanilla `startUseItem` walks
+				// hands in order and would run the other hand first; the calibrated
+				// E-01 boost came from an explicit use, not a key edge (the key only
+				// raises a click while released, which this phase has no tick to
+				// spare).
+				mc.gameMode.useItem(p, mainHand ? InteractionHand.MAIN_HAND : InteractionHand.OFF_HAND);
+				mc.options.keyUse.setDown(false);
+				launchBoostPressed = true;
+				launchFireworksUsed++;
+				return;
+			}
+			if (climbing) launchBoostSeen = true;
+			if (launchBoostSeen) {
+				launchPhase = "handoff";
+				finishLaunch("done", "launched");
+				return;
+			}
+			if (launchBoostWaitTicks > LAUNCH_BOOST_TIMEOUT_TICKS) {
+				finishLaunch("failed", "no_climb");
+			}
+			return;
+		}
+
+		launchPhase = "handoff";
+		finishLaunch("done", "launched");
+	}
+
+	/**
+	 * Aims up and along the goal.
+	 *
+	 * <p>The boost pulls the velocity toward `look * 1.5`, so a level look buys
+	 * speed and no height. A live run raised its cruise band to 194 with a
+	 * 10-degree nose-up and still sank (vy stayed negative), so the climb angle
+	 * here is deliberately steep.
+	 */
+	private void aimForClimb(LocalPlayer p) {
+		if (launchGoalSet) {
+			double dx = launchGoalX - p.getX();
+			double dz = launchGoalZ - p.getZ();
+			if (Math.abs(dx) + Math.abs(dz) > 1.0E-3) {
+				float yaw = (float) (Mth.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0F;
+				p.setYRot(yaw);
+				p.setYHeadRot(yaw);
+				p.setYBodyRot(yaw);
+			}
+		}
+		p.setXRot(LAUNCH_CLIMB_PITCH);
+	}
+
+	/**
+	 * Puts exactly ONE rocket in the offhand, and only when no hand holds one.
+	 *
+	 * NOTICE:
+	 * Why not move the whole stack: the cruise thrust fires the MAIN hand
+	 * (`selectHotbar` + `useItem`), so a macro that parks the entire stack in the
+	 * offhand leaves the flight with no usable rocket and hides the stack from the
+	 * host's inventory read. Live 2026-09-18: after two launches the 52 remaining
+	 * rockets sat in the offhand and the host refused the next takeoff with
+	 * `no firework rockets in the inventory`.
+	 * Root cause: `containerClick` used only PICKUP-button-0, which carries a whole
+	 * stack; the crossbow path tolerates that, a flight does not.
+	 * Fix: pick the stack up, right-click one into the offhand, put the rest back.
+	 * Removal condition: never — a gliding boost must not consume the stack.
+	 */
+	private void equipRocketOffhand(Minecraft mc, LocalPlayer p) {
+		if (p.getOffhandItem().is(Items.FIREWORK_ROCKET))
+			return;
+		if (p.getMainHandItem().is(Items.FIREWORK_ROCKET))
+			return;
+		int slot = findFireworkSlot(p);
+		if (slot < 0 || slot > 35)
+			return;
+		MultiPlayerGameMode gm = mc.gameMode;
+		if (gm == null)
+			return;
+		int containerId = p.inventoryMenu.containerId;
+		int source = toMenuSlot(slot);
+		containerClick(gm, containerId, source, 0, p);
+		containerClick(gm, containerId, 45, 1, p);
+		containerClick(gm, containerId, source, 0, p);
+	}
 
 	/**
 	 * Starts one climb: the first edge becomes active, the rest queue behind it.
@@ -1465,6 +1850,14 @@ public final class BotController {
 			jumpState = "cancelled";
 			jumpEndReason = reason;
 		}
+		// OV-5: a preemption, death or disconnect ends the launch macro the same
+		// way. Without this the macro would keep pressing use after the player
+		// respawned.
+		if (launchState.equals("running")) {
+			launchState = "cancelled";
+			launchEndReason = reason;
+			launchPhase = "idle";
+		}
 		miningPos = null;
 		stopMiningRequested = true;
 		releaseUseRequested = true;
@@ -1494,7 +1887,7 @@ public final class BotController {
 	public synchronized boolean isDriving() {
 		return fwd || back || left || right || jumpHeld || sneak || sprint
 				|| jumpOnceTicks > 0 || path != null || miningPos != null
-				|| jumpState.equals("running")
+				|| jumpState.equals("running") || launchState.equals("running")
 				|| combatPhase != CombatPhase.IDLE || riptidePhase != RiptidePhase.IDLE
 				|| releaseUseRequested || stopMiningRequested;
 	}
@@ -1582,23 +1975,34 @@ public final class BotController {
 			if (path != null) {
 				steer(p);
 			}
+			// OV-5: the launch macro owns the view and the keys while it runs, and
+			// it runs before the jump task so the two can never write input on the
+			// same tick (OV-D17).
+			boolean launchRunning = launchState.equals("running");
+			if (launchRunning) {
+				tickLaunch(mc, p);
+			}
 			// Step 3 arbitration: while the jump task runs it owns both the
 			// movement input and the view. A later controller (the weapon aim)
 			// must not rotate the bot away from the edge it just aligned to.
 			boolean jumpRunning = jumpState.equals("running");
-			if (jumpRunning) {
+			if (jumpRunning && !launchRunning) {
 				tickJump(mc, p);
 			}
 			// MC-4d: the weapon task runs after movement so aiming wins the look
-			// for this tick, and before the use-key hold below.
-			if (combatPhase != CombatPhase.IDLE && !jumpRunning) {
+			// for this tick, and before the use-key hold below. It stays off the
+			// launch macro's ticks (OV-D17): that macro sets its own climb pitch
+			// and spends the rocket, and an aim write between the two would send
+			// the use along the weapon's look vector instead.
+			if (combatPhase != CombatPhase.IDLE && !jumpRunning && !launchRunning) {
 				tickCombat(mc, p);
 			}
 			// MC-4e: the riptide task is mutually exclusive with the weapon task.
 			if (riptidePhase != RiptidePhase.IDLE) {
 				tickRiptide(mc, p);
 			}
-			boolean driving = fwd || back || left || right || jumpHeld || sneak || sprint || jumpOnceTicks > 0 || path != null;
+			boolean driving = fwd || back || left || right || jumpHeld || sneak || sprint || jumpOnceTicks > 0 || path != null
+					|| launchState.equals("running");
 			if (driving) {
 				applyKeys(mc.options);
 				drivingKeys = true;
@@ -2640,17 +3044,7 @@ public final class BotController {
 	private void prepareFireworkOffhand(Minecraft mc, LocalPlayer p) {
 		if (findArrowSlot(p) >= 0)
 			return;
-		if (p.getOffhandItem().is(Items.FIREWORK_ROCKET))
-			return;
-		int slot = findFireworkSlot(p);
-		if (slot < 0 || slot > 35)
-			return;
-		MultiPlayerGameMode gm = mc.gameMode;
-		if (gm == null)
-			return;
-		int containerId = p.inventoryMenu.containerId;
-		containerClick(gm, containerId, toMenuSlot(slot), p);
-		containerClick(gm, containerId, 45, p);
+		equipRocketOffhand(mc, p);
 	}
 
 	private int findArrowSlot(LocalPlayer p) {
@@ -2774,9 +3168,14 @@ public final class BotController {
 	}
 
 	private static void containerClick(MultiPlayerGameMode gm, int containerId, int slot, LocalPlayer p) {
+		containerClick(gm, containerId, slot, 0, p);
+	}
+
+	/** One container click with an explicit mouse button (1 splits a stack). */
+	private static void containerClick(MultiPlayerGameMode gm, int containerId, int slot, int button, LocalPlayer p) {
 		//? if <26.1 {
-		gm.handleInventoryMouseClick(containerId, slot, 0, ClickType.PICKUP, p);
+		gm.handleInventoryMouseClick(containerId, slot, button, ClickType.PICKUP, p);
 		//?} else
-		/*gm.handleContainerInput(containerId, slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, p);*/
+		/*gm.handleContainerInput(containerId, slot, button, net.minecraft.world.inventory.ContainerInput.PICKUP, p);*/
 	}
 }
