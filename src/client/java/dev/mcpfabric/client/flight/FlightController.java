@@ -77,6 +77,8 @@ public final class FlightController {
 		boolean boostAttached;
 		int boostRemainingEstimate;
 		int rocketFlightDuration;
+		int plannedRocketFlightDuration;
+		int firedRocketFlightDuration;
 		int boostFlightDuration;
 		/** Attached firework entity ids this tick; stacking evidence (ab-17). */
 		int boostCount;
@@ -202,6 +204,7 @@ public final class FlightController {
 	private FlightSession.Decision tickDecision;
 	/** True when a rocket left either hand this tick, from any owner. */
 	private boolean tickFiredThisTick;
+	private int tickFiredDuration = -1;
 	/** Launch-macro ignition counter seen at the previous tick (delta → record). */
 	private int launchFireworksUsedSeen;
 	/** Times the drive moved a firework from the inventory into a hand. */
@@ -295,12 +298,18 @@ public final class FlightController {
 		final Float yaw;
 		final Float pitch;
 		final boolean fire;
+		final int rocketFlightDuration;
 
 		InputFrame(String owner, Float yaw, Float pitch, boolean fire) {
+			this(owner, yaw, pitch, fire, -1);
+		}
+
+		InputFrame(String owner, Float yaw, Float pitch, boolean fire, int rocketFlightDuration) {
 			this.owner = owner;
 			this.yaw = yaw;
 			this.pitch = pitch;
 			this.fire = fire;
+			this.rocketFlightDuration = rocketFlightDuration;
 		}
 	}
 
@@ -311,6 +320,7 @@ public final class FlightController {
 			moduleTick++;
 			tickInputOwner = "none";
 			tickFiredThisTick = false;
+			tickFiredDuration = -1;
 			tickDecision = null;
 			// These describe this tick's fallback search, not the last search
 			// of a previous phase or flight. Stale emergency flags polluted
@@ -920,11 +930,14 @@ public final class FlightController {
 			rocketResupplies++;
 		}
 		session.setRocketFlightDuration(selectedRocketDuration(p));
+		int[] availableRecipes = java.util.stream.IntStream.rangeClosed(0, 3)
+				.filter(duration -> rocketSlot(p, duration) != -2).toArray();
+		session.setAvailableRocketDurations(availableRecipes);
 		FlightSession.Decision decision = session.tick(
 				p.getX(), p.getY(), p.getZ(),
 				p.getDeltaMovement().x, p.getDeltaMovement().y, p.getDeltaMovement().z,
 				p.getYRot(), p.getXRot(),
-				rocketsInHands, boostRemaining, sessionTick, cooldownActive);
+				Math.max(rocketsInHands, availableRecipes.length), boostRemaining, sessionTick, cooldownActive);
 		// Keep the decision for the ring even when this tick ends the session:
 		// the failure tick's rejection context must survive endSessionFromReason
 		// (ab-17 audit section 6: the terminal tick's telemetry explains the end).
@@ -968,7 +981,7 @@ public final class FlightController {
 		// The winner's first tick is the frame; the caller applies it once
 		// through the same accessors the launch macro uses, so the server sees
 		// one consistent rotation source (A2: one submit per tick).
-		return new InputFrame("flight-session", decision.yaw, decision.pitch, decision.fireRocket);
+		return new InputFrame("flight-session", decision.yaw, decision.pitch, decision.fireRocket, decision.rocketFlightDuration);
 	}
 
 	/** Applies one frame: the single write of this tick, from one owner. */
@@ -986,12 +999,38 @@ public final class FlightController {
 		if (frame.pitch != null)
 			p.setXRot(frame.pitch);
 		if (frame.fire) {
-			net.minecraft.world.InteractionHand hand = fireworkHand(p);
+			net.minecraft.world.InteractionHand hand;
+			if (frame.rocketFlightDuration >= 0) {
+				int slot = rocketSlot(p, frame.rocketFlightDuration);
+				// Never substitute another recipe after prediction. Offhand is -1,
+				// unavailable is -2; hotbar changes use the same server packet path.
+				if (slot == -2) return;
+				if (slot >= 0) {
+					//? if >=1.21.5 {
+					p.getInventory().setSelectedSlot(slot);
+					//?} else
+					p.getInventory().selected = slot;
+					if (mc.getConnection() != null)
+						mc.getConnection().send(new net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket(slot));
+				}
+				hand = slot == -1 ? net.minecraft.world.InteractionHand.OFF_HAND : net.minecraft.world.InteractionHand.MAIN_HAND;
+			} else hand = fireworkHand(p);
 			if (hand != null) {
+				tickFiredDuration = rocketDuration(p.getItemInHand(hand));
 				mc.gameMode.useItem(p, hand);
 				tickFiredThisTick = true;
 			}
 		}
+	}
+
+	/** Returns a directly executable recipe source, without moving inventory stacks. */
+	private static int rocketSlot(LocalPlayer p, int duration) {
+		if (isFireworkItem(p.getOffhandItem()) && rocketDuration(p.getOffhandItem()) == duration) return -1;
+		for (int slot = 0; slot < 9; slot++) {
+			ItemStack stack = p.getInventory().getItem(slot);
+			if (isFireworkItem(stack) && rocketDuration(stack) == duration) return slot;
+		}
+		return -2;
 	}
 	private static int rocketDuration(ItemStack stack) {
 		var fireworks = stack.get(net.minecraft.core.component.DataComponents.FIREWORKS);
@@ -1156,6 +1195,8 @@ public final class FlightController {
 		record.boostRemainingEstimate = boostRemainingEstimateFor(tickBoostIds);
 		record.boostCount = tickBoostIds.size();
 		record.rocketFlightDuration = selectedRocketDuration(p);
+		record.plannedRocketFlightDuration = tickDecision == null ? -1 : tickDecision.rocketFlightDuration;
+		record.firedRocketFlightDuration = tickFiredDuration;
 		record.boostFlightDuration = tickBoostIds.stream().mapToInt(id -> boostDurations.getOrDefault(id, 0)).max().orElse(-1);
 		record.boostEntityIds = tickBoostIds.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
 	}
@@ -1818,6 +1859,8 @@ public final class FlightController {
 				sample.addProperty("boostAttached", record.boostAttached);
 				sample.addProperty("boostRemainingEstimate", record.boostRemainingEstimate);
 				sample.addProperty("rocketFlightDuration", record.rocketFlightDuration);
+				sample.addProperty("plannedRocketFlightDuration", record.plannedRocketFlightDuration);
+				sample.addProperty("firedRocketFlightDuration", record.firedRocketFlightDuration);
 				sample.addProperty("boostFlightDuration", record.boostFlightDuration);
 				sample.addProperty("boostCount", record.boostCount);
 				sample.addProperty("boostEntityIds", record.boostEntityIds);

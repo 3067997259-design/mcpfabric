@@ -115,6 +115,8 @@ public final class FlightSession {
 		public float yaw;
 		public float pitch;
 		public boolean fireRocket;
+		/** Exact recipe to ignite; -1 means that no ignition was selected. */
+		public int rocketFlightDuration = -1;
 		public int entryIndex;
 		public double entryDistance;
 		public double score;
@@ -396,11 +398,24 @@ public final class FlightSession {
 
 	private int rocketDurationTicks = FlightRocket.nominalTicks(1);
 	private int rocketMaximumTicks = FlightRocket.maximumTicks(1);
+	private int selectedRocketDuration = 1;
+	private int[] availableRocketDurations = { 1 };
+	private int lastWinnerRocketDuration = -1;
 
 	/** The controller supplies the item selected by the actual ignition hand. */
 	public void setRocketFlightDuration(int duration) {
+		selectedRocketDuration = duration;
+		availableRocketDurations = new int[] { duration };
 		rocketDurationTicks = FlightRocket.nominalTicks(duration);
 		rocketMaximumTicks = FlightRocket.maximumTicks(duration);
+	}
+
+	/** Recipes immediately executable from the hands or hotbar this tick.
+	 * Inventory-only stacks need staging before they can enter this set.
+	 */
+	public void setAvailableRocketDurations(int[] durations) {
+		availableRocketDurations = java.util.Arrays.stream(durations)
+				.filter(duration -> duration >= 0 && duration <= 3).distinct().sorted().toArray();
 	}
 
 	/** Prepares the complete decision path before launch, without live world IO or input. */
@@ -417,7 +432,8 @@ public final class FlightSession {
 			var pilot = new FlightSession(List.of(new Waypoint(0,70,0),new Waypoint(0,70,150)),
 					(x,y,z) -> y < 60 ? "stone" : "air",System.currentTimeMillis()+2000,warmParams,0);
 			try {
-				var state = new FlightDynamics.State(0,70,0,0,0,1,26);
+				pilot.setAvailableRocketDurations(new int[] { 1, 2, 3 });
+				var state = new FlightDynamics.State(0,70,0,0,0,1,0);
 				float yaw = 0, pitch = 0;
 				for (int index = 0; index < 8; index++) {
 					var decision = pilot.tick(state.x,state.y,state.z,state.vx,state.vy,state.vz,
@@ -1254,7 +1270,8 @@ public final class FlightSession {
 		long candidatesStartedAt = System.nanoTime();
 		search:
 		for (CandidateSpec spec : order) {
-			if (evaluated >= params.maxCandidates) {
+			if (evaluated >= params.maxCandidates + Math.max(0, availableRocketDurations.length - 1)
+					* params.yawOffsets.length * PitchPolicy.values().length) {
 				budgetExhausted = true;
 				budgetReason = "candidate_cap";
 				break search;
@@ -1276,7 +1293,7 @@ public final class FlightSession {
 				continue;
 			Candidate candidate = evaluate(spec.yawOffset, spec.policy, spec.fire,
 					x, y, z, vx, vy, vz, rocketTicksRemaining, rockets, sessionTick, routeLowerBound,
-					yaw, pitch);
+					yaw, pitch, params.horizonTicks, spec.duration < 0 ? selectedRocketDuration : spec.duration);
 			evaluated++;
 			if (candidate == null)
 				continue;
@@ -1292,11 +1309,14 @@ public final class FlightSession {
 		// thrust remains available when all glides fail them.
 		double boostedSpeed = FlightDynamics.ROCKET_TARGET_SPEED
 				+ FlightDynamics.ROCKET_BASE_ACCEL / FlightDynamics.ROCKET_PULL;
-		double stopWindow = Math.max(Math.hypot(vx, vz), boostedSpeed)
-				* (rocketMaximumTicks + params.horizonTicks);
 		double remaining = cumulative[path.size() - 1] - progressOf(entryIndex,
 				new FlightDynamics.State(x, y, z, vx, vy, vz, rocketTicksRemaining));
-		Candidate best = selectVerifiedBest(feasible, params.stopAtEnd && remaining <= stopWindow);
+		for (Candidate candidate : feasible) {
+			candidate.deferIgnition = candidate.fire && params.stopAtEnd
+					&& remaining <= Math.max(Math.hypot(vx, vz), boostedSpeed)
+						* (FlightRocket.maximumTicks(candidate.rocketFlightDuration) + params.horizonTicks);
+		}
+		Candidate best = selectVerifiedBest(feasible);
 		// A full feedback policy can hit the next bend after the worker's
 		// handoff. Before buying irreversible thrust, try a short climbing
 		// bridge. It is executable only after the planner reserves it, with
@@ -1328,6 +1348,7 @@ public final class FlightSession {
 			lastWinnerYawOffset = best.yawOffset;
 			lastWinnerPolicy = best.policy;
 			lastWinnerFire = best.fire;
+			lastWinnerRocketDuration = best.rocketFlightDuration;
 		}
 		decision.score = best == null ? Double.POSITIVE_INFINITY : best.progress;
 		int rejected = evaluated - feasibleCount;
@@ -1422,6 +1443,7 @@ public final class FlightSession {
 		decision.yaw = best.firstYaw;
 		decision.pitch = best.firstPitch;
 		decision.fireRocket = best.fire;
+		decision.rocketFlightDuration = best.fire ? best.rocketFlightDuration : -1;
 		decision.predictedEndTicks = best.endTicks;
 		decision.predictedEndCursor = best.endCursor;
 		decision.predictedEndX = best.endX;
@@ -1505,6 +1527,19 @@ public final class FlightSession {
 	private Candidate evaluate(float yawOffset, PitchPolicy pitchPolicy, boolean fire,
 			double x, double y, double z, double vx, double vy, double vz, int rocketTicksRemaining,
 			int rockets, long sessionTick, double routeLowerBound, float currentYaw, float currentPitch, int horizonTicks) {
+		return evaluate(yawOffset, pitchPolicy, fire, x, y, z, vx, vy, vz, rocketTicksRemaining,
+				rockets, sessionTick, routeLowerBound, currentYaw, currentPitch, horizonTicks, selectedRocketDuration);
+	}
+
+	private Candidate evaluate(float yawOffset, PitchPolicy pitchPolicy, boolean fire,
+			double x, double y, double z, double vx, double vy, double vz, int rocketTicksRemaining,
+			int rockets, long sessionTick, double routeLowerBound, float currentYaw, float currentPitch,
+			int horizonTicks, int flightDuration) {
+		int rocketDurationTicks = FlightRocket.nominalTicks(flightDuration);
+		int rocketMaximumTicks = FlightRocket.maximumTicks(flightDuration);
+		boolean mixedRecipes = availableRocketDurations.length > 1;
+		FlightDynamics.State scoreState = null;
+		int scoreCursor = entryIndex;
 		FlightDynamics.State state = new FlightDynamics.State(
 				x, y, z, vx, vy, vz, Math.max(0, rocketTicksRemaining));
 		boolean rocketPlanned = false;
@@ -1541,6 +1576,12 @@ public final class FlightSession {
 		// horizon+6 wasted a fifth of every candidate's physics).
 		int maxTicks = horizonTicks + TERMINAL_LOOKAHEAD_TICKS;
 		int screeningTicks = horizonTicks;
+		if (mixedRecipes && fire) {
+			// Comparing recipes needs their tail checked, but not rewarded as
+			// extra progress. All quality scores below use the common horizon.
+			screeningTicks = Math.max(screeningTicks, rocketMaximumTicks);
+			maxTicks = screeningTicks + TERMINAL_LOOKAHEAD_TICKS;
+		}
 		double remaining = cumulative[path.size() - 1] - progressOf(entryIndex, state);
 		double boostedSpeed = FlightDynamics.ROCKET_TARGET_SPEED
 				+ FlightDynamics.ROCKET_BASE_ACCEL / FlightDynamics.ROCKET_PULL;
@@ -1660,6 +1701,10 @@ public final class FlightSession {
 			else if (tick - arrivedTick >= TERMINAL_LOOKAHEAD_TICKS) {
 				break;
 			}
+			if (tick + 1 == horizonTicks) {
+				scoreState = state;
+				scoreCursor = cursor;
+			}
 		}
 		// Continuation feasibility (R4 client review 2 and 2026-09-21 follow-up):
 		// can this trajectory keep flying? Below the surface under its own end
@@ -1698,10 +1743,13 @@ public final class FlightSession {
 		candidate.controls = controls;
 		candidate.yawOffset = yawOffset;
 		candidate.policy = pitchPolicy;
-		candidate.policyId = String.format(java.util.Locale.ROOT, "%+.0f:%s:%s", yawOffset, pitchPolicy.name(), fire ? "fire" : "glide");
+		candidate.policyId = String.format(java.util.Locale.ROOT, "%+.0f:%s:%s", yawOffset, pitchPolicy.name(), fire ? "fire:" + flightDuration : "glide");
 		candidate.firstYaw = firstYaw;
 		candidate.firstPitch = firstPitch;
 		candidate.fire = rocketPlanned;
+		candidate.rocketFlightDuration = fire ? flightDuration : -1;
+		candidate.recipeCost = fire && remaining > boostedSpeed * (rocketMaximumTicks + params.horizonTicks)
+				? -flightDuration : flightDuration;
 		candidate.arrived = arrived;
 		candidate.arrivalX = arrivedX;
 		candidate.arrivalY = arrivedY;
@@ -1725,11 +1773,14 @@ public final class FlightSession {
 		// the selection order lives in {@link #selectBest} (B3: no pairwise
 		// "within one block counts as equal" comparator — that relation is not
 		// transitive and made the enumeration order decide the winner).
-		candidate.progress = progressOf(cursor, state);
-		candidate.lateral = Math.hypot(state.x - endReference.x(), state.z - endReference.z());
-		candidate.heightError = Math.abs(state.y - endReference.y());
-		candidate.trackingErrorSquared = cursor < path.size()
-				? routeTrackingErrorSquared(cursor, state) : candidate.lateral * candidate.lateral;
+		FlightDynamics.State qualityState = mixedRecipes && scoreState != null ? scoreState : state;
+		int qualityCursor = mixedRecipes && scoreState != null ? scoreCursor : cursor;
+		Waypoint qualityReference = referenceFor(qualityCursor, qualityState);
+		candidate.progress = progressOf(qualityCursor, qualityState);
+		candidate.lateral = Math.hypot(qualityState.x - qualityReference.x(), qualityState.z - qualityReference.z());
+		candidate.heightError = Math.abs(qualityState.y - qualityReference.y());
+		candidate.trackingErrorSquared = qualityCursor < path.size()
+				? routeTrackingErrorSquared(qualityCursor, qualityState) : candidate.lateral * candidate.lateral;
 		candidate.controlChange = Math.abs(stepPitch(currentPitch, firstPitch)) + Math.abs(bearingDelta(firstYaw, currentYaw));
 		return candidate;
 	}
@@ -1887,7 +1938,9 @@ public final class FlightSession {
 	}
 
 	/** One (yaw, policy, fire) candidate in the global priority order. */
-	private record CandidateSpec(float yawOffset, PitchPolicy policy, boolean fire) {}
+	private record CandidateSpec(float yawOffset, PitchPolicy policy, boolean fire, int duration) {
+		CandidateSpec(float yawOffset, PitchPolicy policy, boolean fire) { this(yawOffset, policy, fire, -1); }
+	}
 
 	/**
 	 * The bounded candidate list in one global priority order (ab-24 audit
@@ -1903,8 +1956,9 @@ public final class FlightSession {
 			if (seen.add(spec))
 				order.add(spec);
 		};
-		if (lastWinnerPolicy != null)
-			add.accept(new CandidateSpec(lastWinnerYawOffset, lastWinnerPolicy, lastWinnerFire));
+		if (lastWinnerPolicy != null && (!lastWinnerFire
+				|| java.util.Arrays.binarySearch(availableRocketDurations, lastWinnerRocketDuration) >= 0))
+			add.accept(new CandidateSpec(lastWinnerYawOffset, lastWinnerPolicy, lastWinnerFire, lastWinnerRocketDuration));
 		for (float yawOffset : params.yawOffsets) {
 			add.accept(new CandidateSpec(yawOffset, PitchPolicy.LEVEL, false));
 			add.accept(new CandidateSpec(yawOffset, PitchPolicy.PULL_UP, false));
@@ -1914,8 +1968,10 @@ public final class FlightSession {
 			add.accept(new CandidateSpec(yawOffset, PitchPolicy.AIM_PULL, false));
 		}
 		for (float yawOffset : params.yawOffsets) {
-			for (PitchPolicy policy : PitchPolicy.values())
-				add.accept(new CandidateSpec(yawOffset, policy, true));
+			for (PitchPolicy policy : PitchPolicy.values()) {
+				for (int duration : availableRocketDurations)
+					add.accept(new CandidateSpec(yawOffset, policy, true, duration));
+			}
 		}
 		return order;
 	}
@@ -1928,7 +1984,7 @@ public final class FlightSession {
 	 * Candidates below it are NOT treated as unsafe — they simply lose on
 	 * progress and are left unverified, which the counters report.
 	 */
-	private Candidate selectVerifiedBest(java.util.List<Candidate> feasible, boolean preferGlide) {
+	private Candidate selectVerifiedBest(java.util.List<Candidate> feasible) {
 		if (feasible.isEmpty())
 			return null;
 		// An explicit stop still needs a verified recovery. A zero handover
@@ -1947,17 +2003,16 @@ public final class FlightSession {
 		// terminal verification runs inside that quality order; only when the
 		// whole band fails does the out-of-band tail get its turn, by progress.
 		java.util.List<Candidate> ordered = new java.util.ArrayList<>();
-		if (preferGlide) {
-			java.util.List<Candidate> glides = new java.util.ArrayList<>();
-			java.util.List<Candidate> thrusts = new java.util.ArrayList<>();
-			for (Candidate candidate : feasible) {
-				if (candidate.fire) thrusts.add(candidate);
-				else glides.add(candidate);
-			}
-			ordered.addAll(rankByProgressAndQuality(glides));
-			ordered.addAll(rankByProgressAndQuality(thrusts));
+		java.util.List<Candidate> ordinary = new java.util.ArrayList<>();
+		java.util.List<Candidate> delayedIgnitions = new java.util.ArrayList<>();
+		for (Candidate candidate : feasible) {
+			// Each recipe owns its stopping window. A long rocket must not
+			// borrow the shorter window just because short rockets are stocked.
+			if (candidate.deferIgnition) delayedIgnitions.add(candidate);
+			else ordinary.add(candidate);
 		}
-		else ordered.addAll(rankByProgressAndQuality(feasible));
+		ordered.addAll(rankByProgressAndQuality(ordinary));
+		ordered.addAll(rankByProgressAndQuality(delayedIgnitions));
 		int checked = 0;
 		for (Candidate candidate : ordered) {
 			if (!candidate.arrived) {
@@ -2065,6 +2120,9 @@ public final class FlightSession {
 		if (result != 0)
 			return result;
 		result = Boolean.compare(a.fire, b.fire);
+		if (result != 0)
+			return result;
+		result = Integer.compare(a.recipeCost, b.recipeCost);
 		if (result != 0)
 			return result;
 		// A NEUTRAL final tie-break: the smallest absolute yaw offset first
@@ -2569,6 +2627,9 @@ public final class FlightSession {
 		float firstYaw;
 		float firstPitch;
 		boolean fire;
+		int rocketFlightDuration = -1;
+		int recipeCost;
+		boolean deferIgnition;
 		/** Monotonic route progress at the prediction end (B3). */
 		double progress;
 		/** Horizontal tracking error at the prediction end. */

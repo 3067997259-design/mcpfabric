@@ -62,7 +62,11 @@ final class FlightPlanning {
 			if (result == null || result.plan() == null) {
 				lastResult = result == null ? "worker_failed"
 						: result.reason() + ":" + result.rollouts() + ":" + result.elapsedMs() + "ms";
-				pending = null; reserved = List.of(); status = "failed_early"; retryAfter = tick;
+				pending = null; reserved = List.of(); status = "failed_early";
+				// Release control immediately, but retain this request's time slot.
+				// Fast no_sequence results otherwise spend all six attempts in
+				// one second, before the approach reaches a different entry state.
+				retryAfter = Math.max(tick + 2, dueTick);
 				return null;
 			}
 		}

@@ -17,6 +17,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class FlightSessionContinuationTest {
 	@Test
+	void ignitionUsesAnOfferedRecipeInsteadOfTheDefaultHandRecipe() {
+		// ROOT CAUSE: prediction only knew the default hand's duration and
+		// returned a boolean ignition. A different physical recipe could not
+		// be requested or correlated with the simulated action.
+		var params = new FlightSession.Params(); params.simBudgetMs = 1000;
+		var pilot = new FlightSession(
+				List.of(new FlightSession.Waypoint(0, 66, 0), new FlightSession.Waypoint(0, 64, 200)),
+				RIVER, System.currentTimeMillis() + 60000, params);
+		pilot.setRocketFlightDuration(1);
+		pilot.setAvailableRocketDurations(new int[] { 3 });
+		var decision = pilot.tick(0, 66, 0, .5, -.1, -.4, 180, -6, 64, 0, 0, false);
+		assertTrue(decision.applicable, decision.note);
+		assertTrue(decision.fireRocket, decision.note);
+		org.junit.jupiter.api.Assertions.assertEquals(3, decision.rocketFlightDuration);
+	}
+
+	@Test
 	void levelRouteDoesNotRewardAnUnnecessaryLateralTurn() {
 		// ROOT CAUSE: distance to a future waypoint included forward travel.
 		// A -15 degree turn won on a straight route with zero lateral error.

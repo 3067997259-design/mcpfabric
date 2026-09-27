@@ -23,6 +23,8 @@ class FlightPlanningTest {
 				Thread.sleep(5);
 			}
 			assertTrue(planning.status().startsWith("failed_early"), planning.status());
+			assertFalse(planning.canReserveShort(next, 1), "failure must not burn another request in the same slot");
+			assertTrue(planning.canReserveShort(next, 12), "the next slot may use a fresh measured origin");
 		} finally { planning.close(); }
 	}
 	@Test void shortReservationRequiresReadinessAndHandsOverAtEightTicks() {
