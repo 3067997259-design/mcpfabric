@@ -49,6 +49,26 @@ dependencies {
 		modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 		modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 	}
+	// Client-side flight logic (the session, the dynamics) is pure Java and is
+	// covered by unit tests; regressions there must fail the build, not a live
+	// flight (R4 client review 2026-09-21: the hold target shadowing).
+	testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.10.2"
+}
+
+// The flight session lives in the client source set (split environments).
+sourceSets {
+	test {
+		compileClasspath += sourceSets.client.output
+		runtimeClasspath += sourceSets.client.output
+	}
+}
+
+tasks.named("test") {
+	useJUnitPlatform()
+	testLogging {
+		events "passed", "failed", "skipped"
+	}
 }
 
 processResources {

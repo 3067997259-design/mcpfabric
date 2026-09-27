@@ -31,9 +31,20 @@ public final class RpcRouter {
 			"control.", "nav.", "combat.", "movement.", "interact."
 	};
 
+	/**
+	 * Flight methods that write state. They renew the heartbeat, because an
+	 * accepted channel authorizes input until its deadline (R2b). The reads
+	 * {@code flight.observe} and {@code flight.status} must never renew it:
+	 * only control requests extend a live drive (CD-0 §3.1).
+	 */
+	private static final java.util.Set<String> CONTROL_METHOD_NAMES = java.util.Set.of(
+			"flight.submit", "flight.boost", "flight.revoke");
+
 	private static boolean isControlMethod(String method) {
 		if (method == null)
 			return false;
+		if (CONTROL_METHOD_NAMES.contains(method))
+			return true;
 		for (String prefix : CONTROL_METHOD_PREFIXES) {
 			if (method.startsWith(prefix))
 				return true;

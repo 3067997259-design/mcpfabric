@@ -574,6 +574,65 @@ export const TOOLS: ToolDef[] = [
     annotations: READ,
   },
   {
+    name: "flight_observe",
+    method: "flight.observe",
+    title: "Flight same-tick observation",
+    description:
+      "Client-only. R2a. One same-tick flight snapshot: position, velocity, yaw/pitch, gliding, collision box, health/food, equipment, the boost state (attached flag + remaining-ticks estimate from the measured 35-tick plateau, source marked), the launch handover facts, and the flight session state. Everything is read in one call on the game thread.",
+    inputSchema: {},
+    annotations: READ,
+  },
+  {
+    name: "flight_submit",
+    method: "flight.submit",
+    title: "Submit a flight channel",
+    description:
+      "Client-only. R2b. Submit a flight channel: sessionId (idempotent for an ACCEPTED session — a repeat returns the original acceptance; refused attempts are not remembered, so a corrected retry with the same id is re-evaluated), controlSessionId, generation (an older one is rejected as stale and the receipt names the expected one), revision, deadlineMs, dimension and a channel payload. The channel path (2+ waypoints) starts the client per-tick driver; the client requests the launch macro while grounded, waits for its handoff, then owns yaw/pitch/firework writes until the channel ends. Channel fields: path (ordered waypoints), entryReach (advance radius; the adopted value is echoed). Rejected with session_active, control_busy, stale_generation or stale_control_session. Accepted channels are a finite autonomous window: submit/boost/revoke renew the bridge heartbeat, observe/status do not, and the controller enforces the deadline in every phase.",
+    inputSchema: {
+      sessionId: z.string().describe("Unique channel session id; repeats are idempotent."),
+      controlSessionId: z.string().optional().describe("Input control session this channel belongs to."),
+      generation: z.number().optional().describe("Connection generation; an older value is rejected as stale."),
+      revision: z.number().optional().describe("Channel revision inside the session."),
+      deadlineMs: z.number().optional().describe("Absolute wall-clock deadline in epoch ms. Default 120 s from submit."),
+      dimension: z.string().optional().describe("Expected dimension id, e.g. minecraft:overworld. A change terminates the session."),
+      channel: z.object({}).passthrough().optional().describe("Opaque channel payload; path and entryReach are the fields the R2b driver consumes."),
+    },
+    annotations: WRITE,
+  },
+  {
+    name: "flight_status",
+    method: "flight.status",
+    title: "Flight session status and trajectory batch",
+    description:
+      "Client-only. Report the session state (accepted/running/revoked/terminated), endReason, whether input application has started, the adopted entryReach, and the bounded trajectory ring: samples newer than sinceTick (oldest first), each with tick, phase, position, velocity, yaw/pitch, gliding, boost estimate, rocketFiredThisTick and the input owner (none / launch-macro / flight-session). trajectoryLost counts records the ring already overwrote — a non-zero value means the batch has holes.",
+    inputSchema: {
+      sinceTick: z.number().optional().describe("Return records with tick strictly greater than this. Advance the cursor with the highest tick seen; default 0 returns everything held."),
+    },
+    annotations: READ,
+  },
+  {
+    name: "flight_revoke",
+    method: "flight.revoke",
+    title: "Revoke the flight channel",
+    description:
+      "Client-only. Revoke the named channel: the session stops at once (endReason=revoked), the launch macro is cancelled, and the response separates the revoke request from the confirmed release. A mismatched sessionId is reported, not applied.",
+    inputSchema: {
+      sessionId: z.string().describe("The channel session id to revoke."),
+    },
+    annotations: WRITE,
+  },
+  {
+    name: "flight_boost",
+    method: "flight.boost",
+    title: "Fire one firework (deduplicated)",
+    description:
+      "Client-only. R2a. Fire one firework rocket from either hand, deduplicated by opId: a repeated opId returns the first response verbatim and does not fire again. Requires a firework rocket in the main or off hand; otherwise reports no_firework_in_hands. The ignition lands in the trajectory ring.",
+    inputSchema: {
+      opId: z.string().describe("Unique ignition operation id; repeats never fire twice."),
+    },
+    annotations: WRITE,
+  },
+  {
     name: "jump_plan_cancel",
     method: "movement.jumpCancel",
     title: "Abort the jump task",

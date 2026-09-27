@@ -1,6 +1,7 @@
 package dev.mcpfabric.client;
 
 import dev.mcpfabric.McpFabric;
+import dev.mcpfabric.client.flight.FlightController;
 import dev.mcpfabric.client.reflex.ReflexController;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
@@ -30,6 +31,10 @@ public final class ClientControlGuard {
 	 */
 	private static void clearControls(String reason) {
 		BotController.get().clearAll(reason);
+		// R2b: a lifecycle stop ends the flight channel too. Without this the
+		// cancelled launch macro and the still-accepted session would outlive
+		// the input revocation.
+		FlightController.get().externalStop(reason);
 		ControlOwnership.revoke();
 	}
 
@@ -84,7 +89,13 @@ public final class ClientControlGuard {
 		if (lastRequest != lastSeenControlRequestAt) {
 			lastSeenControlRequestAt = lastRequest;
 		}
-		else if (BotController.get().isDriving() && now - lastSeenControlRequestAt > timeout) {
+		else if (BotController.get().isDriving()
+				&& !FlightController.get().hasLiveChannel()
+				&& now - lastSeenControlRequestAt > timeout) {
+			// A live flight channel is exempt: it is a finite autonomous window
+			// that ends on its own deadline, death, disconnect, dimension
+			// change or revoke. The controller enforces the deadline later in
+			// this same tick, so the end reason stays `deadline`.
 			clearControls("bridge_timeout");
 			// Avoid clearing on every silent tick.
 			lastSeenControlRequestAt = now;

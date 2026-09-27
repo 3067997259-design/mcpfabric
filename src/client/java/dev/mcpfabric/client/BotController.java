@@ -509,6 +509,16 @@ public final class BotController {
 		return launchState.equals("running");
 	}
 
+	/** The launch macro's terminal reason; the flight session reads it when a handoff fails. */
+	public synchronized String launchEndReason() {
+		return launchEndReason;
+	}
+
+	/** Rockets the launch macro has spent; the flight controller records the tick delta. */
+	public synchronized int launchFireworksUsed() {
+		return launchFireworksUsed;
+	}
+
 	public synchronized JsonObject launchStatusJson() {
 		JsonObject o = new JsonObject();
 		o.addProperty("state", launchState);
@@ -773,22 +783,32 @@ public final class BotController {
 	 * Fix: pick the stack up, right-click one into the offhand, put the rest back.
 	 * Removal condition: never — a gliding boost must not consume the stack.
 	 */
-	private void equipRocketOffhand(Minecraft mc, LocalPlayer p) {
+	/**
+	 * Makes sure a firework is in a hand, moving one from the inventory when
+	 * both hands are empty. Returns true when a hand holds a rocket afterwards.
+	 *
+	 * The flight driver calls this every tick it needs to fire: the launch
+	 * macro parks exactly one rocket in the offhand, and without a resupply
+	 * step a long drive has no usable rockets even with a full inventory
+	 * (R4 cave-diag-16: inventory 623, zero ignitions during the drive).
+	 */
+	public boolean equipRocketOffhand(Minecraft mc, LocalPlayer p) {
 		if (p.getOffhandItem().is(Items.FIREWORK_ROCKET))
-			return;
+			return true;
 		if (p.getMainHandItem().is(Items.FIREWORK_ROCKET))
-			return;
+			return true;
 		int slot = findFireworkSlot(p);
 		if (slot < 0 || slot > 35)
-			return;
+			return false;
 		MultiPlayerGameMode gm = mc.gameMode;
 		if (gm == null)
-			return;
+			return false;
 		int containerId = p.inventoryMenu.containerId;
 		int source = toMenuSlot(slot);
 		containerClick(gm, containerId, source, 0, p);
 		containerClick(gm, containerId, 45, 1, p);
 		containerClick(gm, containerId, source, 0, p);
+		return p.getOffhandItem().is(Items.FIREWORK_ROCKET) || p.getMainHandItem().is(Items.FIREWORK_ROCKET);
 	}
 
 	/**
@@ -1892,6 +1912,19 @@ public final class BotController {
 				|| releaseUseRequested || stopMiningRequested;
 	}
 
+	/**
+	 * True while another per-tick input task owns the player. The flight
+	 * channel must not start on top of a legacy drive (R2b). The one-tick
+	 * cleanup flags in {@link #isDriving()} are housekeeping, not ownership, so
+	 * they do not count here.
+	 */
+	public synchronized boolean hasActiveInputTask() {
+		return fwd || back || left || right || jumpHeld || sneak || sprint
+				|| jumpOnceTicks > 0 || path != null || miningPos != null
+				|| jumpState.equals("running") || launchState.equals("running")
+				|| combatPhase != CombatPhase.IDLE || riptidePhase != RiptidePhase.IDLE;
+	}
+
 	/** Records the terminal distance/position for the status report. */
 	private void captureEnd(String reason) {
 		navEndReason = reason;
@@ -1969,6 +2002,10 @@ public final class BotController {
 					releaseKeys(mc.options);
 					drivingKeys = false;
 				}
+				// R2a: the flight observer tracks disconnects even without a
+				// player, so a session terminates with a reason instead of
+				// silently freezing.
+				dev.mcpfabric.client.flight.FlightController.get().onClientTick(mc, null);
 				return;
 			}
 
@@ -2001,6 +2038,10 @@ public final class BotController {
 			if (riptidePhase != RiptidePhase.IDLE) {
 				tickRiptide(mc, p);
 			}
+			// R2a: the flight observer records after the task ticks, so its
+			// samples see the post-input state of this tick. It never writes
+			// input in R2a (that is R2b's session driver).
+			dev.mcpfabric.client.flight.FlightController.get().onClientTick(mc, p);
 			boolean driving = fwd || back || left || right || jumpHeld || sneak || sprint || jumpOnceTicks > 0 || path != null
 					|| launchState.equals("running");
 			if (driving) {
@@ -3165,6 +3206,32 @@ public final class BotController {
 		if (inv >= 9 && inv <= 35)
 			return inv;
 		return 45;
+	}
+
+	/**
+	 * R2b: equips an elytra from the inventory into the chest slot when the
+	 * bot is not wearing one. Shift-click moves the stack straight into the
+	 * armour slot. Returns the post-action chest state, so the flight session
+	 * can gate its launch on a real equip instead of a hoped-for one.
+	 */
+	public synchronized boolean equipElytraChest(Minecraft mc, LocalPlayer p) {
+		if (p.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).is(Items.ELYTRA))
+			return true;
+		MultiPlayerGameMode gm = mc.gameMode;
+		if (gm == null)
+			return false;
+		for (int slot = 0; slot <= 35; slot++) {
+			if (p.getInventory().getItem(slot).is(Items.ELYTRA)) {
+				//? if <26.1 {
+				gm.handleInventoryMouseClick(p.inventoryMenu.containerId, toMenuSlot(slot), 0,
+						net.minecraft.world.inventory.ClickType.QUICK_MOVE, p);
+				//?} else
+				/*gm.handleContainerInput(p.inventoryMenu.containerId, toMenuSlot(slot), 0,
+						net.minecraft.world.inventory.ContainerInput.QUICK_MOVE, p);*/
+				return p.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).is(Items.ELYTRA);
+			}
+		}
+		return false;
 	}
 
 	private static void containerClick(MultiPlayerGameMode gm, int containerId, int slot, LocalPlayer p) {
